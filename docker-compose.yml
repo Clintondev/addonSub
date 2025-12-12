@@ -1,0 +1,32 @@
+version: "3.9"
+
+services:
+  addon:
+    build: .
+    container_name: stremio-pt-auto-addon
+    env_file:
+      - .env
+    ports:
+      - "7000:7000"
+    volumes:
+      - .:/usr/src/app
+      - ./storage:/usr/src/app/storage
+    depends_on:
+      - redis
+      - libretranslate
+    command: sh -c "npm install && npm run start"
+
+  redis:
+    image: redis:7
+    container_name: stremio-pt-auto-redis
+    restart: unless-stopped
+
+  libretranslate:
+    image: libretranslate/libretranslate:latest
+    container_name: stremio-pt-auto-libretranslate
+    restart: unless-stopped
+    environment:
+      - LT_API_KEY=none
+    ports:
+      - "5000:5000"
+
