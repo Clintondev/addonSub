@@ -1,84 +1,59 @@
 const fs = require("fs");
-const path = require("path");
-const fetch = require("node-fetch");
 const config = require("../config");
 const logger = require("../logger");
 const { enqueueSubtitleJob } = require("../jobs/queue");
-const { hashUrl, signSubtitlePath } = require("../utils/security");
+const { signPath, safeChildPath } = require("../utils/security");
 const { inc } = require("../metrics");
-const { mergeMeta, readMeta } = require("./metadata");
+const { repairSubtitleLayout } = require("./subtitleLayout");
 
-function videoDir(videoKey) {
-  return path.join(config.storageDir, videoKey);
+function sourceDir(sourceId) {
+  return safeChildPath(config.storageDir, "subtitles", sourceId);
 }
 
-function ensureVideoDir(videoKey) {
-  fs.mkdirSync(videoDir(videoKey), { recursive: true });
+function ensureSourceDir(sourceId) {
+  fs.mkdirSync(sourceDir(sourceId), { recursive: true });
 }
 
-function subtitlePath(videoKey, fileName) {
-  return path.join(videoDir(videoKey), fileName);
+function subtitlePath(sourceId, fileName) {
+  return safeChildPath(sourceDir(sourceId), fileName);
 }
 
-function subtitleUrl(videoKey, fileName) {
-  const token = signSubtitlePath(
-    videoKey,
-    fileName,
-    config.subtitleTokenSecret || "change-me"
-  );
-  return `${config.baseUrl}/assets/subtitles/${videoKey}/${fileName}?token=${token}`;
+function subtitleUrl(sourceId, fileName) {
+  const { token } = signPath([sourceId, fileName], config.subtitleTokenSecret, config.signedUrlTtlSeconds);
+  return `${config.baseUrl}/assets/subtitles/${encodeURIComponent(sourceId)}/${encodeURIComponent(fileName)}?token=${token}`;
 }
 
-function translationStatus(videoKey) {
-  const translated = subtitlePath(videoKey, "pt-auto.vtt");
+function translationStatus(sourceId) {
+  const translated = subtitlePath(sourceId, "pt-BR.vtt");
   if (fs.existsSync(translated)) {
+    try { repairSubtitleLayout(sourceId); } catch (error) { logger.warn("Falha ao preservar layout da legenda", { sourceId, error: error.message }); }
     inc("cache_hits");
-    return { status: "ready", path: translated, url: subtitleUrl(videoKey, "pt-auto.vtt") };
+    const ass = subtitlePath(sourceId, "pt-BR.ass");
+    return {
+      status: "ready",
+      path: translated,
+      url: subtitleUrl(sourceId, "pt-BR.vtt"),
+      assPath: fs.existsSync(ass) ? ass : null,
+      assUrl: fs.existsSync(ass) ? subtitleUrl(sourceId, "pt-BR.ass") : null,
+    };
   }
-  return { status: "pending" };
+  const failed = subtitlePath(sourceId, "failed.json");
+  return { status: fs.existsSync(failed) ? "failed" : "pending" };
 }
 
-async function queueTranslationJob({ videoKey, targetUrl, streamType }) {
-  ensureVideoDir(videoKey);
-  return enqueueSubtitleJob({
-    videoKey,
-    targetUrl,
-    streamType,
-    storageDir: videoDir(videoKey),
-    targetLocale: config.targetLocale,
-    libreTranslateUrl: config.libreTranslateUrl,
-  });
+async function queueTranslationJob(sourceId, priority = 5) {
+  ensureSourceDir(sourceId);
+  return enqueueSubtitleJob({ sourceId }, priority);
 }
 
-async function savePlaceholderSubtitle(videoKey) {
-  ensureVideoDir(videoKey);
-  const targetFile = subtitlePath(videoKey, "pt-auto.vtt");
-  if (fs.existsSync(targetFile)) return targetFile;
-
-  const payload = [
-    "WEBVTT",
-    "",
-    "00:00:00.000 --> 00:00:02.000",
-    "Legenda PT-AUTO em preparação...",
-    "",
-  ].join("\n");
-
-  fs.writeFileSync(targetFile, payload, "utf8");
-  logger.info("Wrote placeholder subtitle", { targetFile });
-  return targetFile;
+async function savePendingSubtitle(sourceId) {
+  ensureSourceDir(sourceId);
+  const file = subtitlePath(sourceId, "pending.vtt");
+  if (!fs.existsSync(file)) {
+    fs.writeFileSync(file, "WEBVTT\n\n00:00:00.000 --> 00:00:03.000\nLegenda PT-AUTO em preparação. Atualize em instantes.\n", "utf8");
+    logger.info("Created pending subtitle", { sourceId });
+  }
+  return file;
 }
 
-function deriveVideoKey({ type, id, targetUrl }) {
-  const hash = hashUrl(targetUrl || id || "");
-  return `${type || "video"}.${id || "unknown"}.${hash}`;
-}
-
-module.exports = {
-  deriveVideoKey,
-  ensureVideoDir,
-  translationStatus,
-  queueTranslationJob,
-  savePlaceholderSubtitle,
-  subtitleUrl,
-  subtitlePath,
-};
+module.exports = { ensureSourceDir, translationStatus, queueTranslationJob, savePendingSubtitle, subtitleUrl, subtitlePath };

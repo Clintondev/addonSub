@@ -1,173 +1,228 @@
-require("dotenv").config();
-const { Worker, QueueScheduler } = require("bullmq");
 const fs = require("fs");
 const path = require("path");
+const { Worker } = require("bullmq");
 const config = require("./config");
 const logger = require("./logger");
-const { connection } = require("./jobs/queue");
-const {
-  savePlaceholderSubtitle,
-  subtitlePath,
-  ensureVideoDir,
-} = require("./services/subtitleService");
-const { sanitizeUrl } = require("./utils/security");
+const { getConnection } = require("./jobs/queue");
+const sourceStore = require("./services/sourceStore");
+const { subtitlePath, ensureSourceDir } = require("./services/subtitleService");
 const { extractHlsSubtitle } = require("./services/hls");
 const { extractDashSubtitle } = require("./services/dash");
 const { extractFileSubtitle } = require("./services/ffextract");
+const { releaseTranscriptionModel, transcribeSource } = require("./services/transcribe");
 const { parseVtt, serializeVtt } = require("./services/vtt");
-const {
-  detectLanguage,
-  translateBatch,
-  mapTargetLocale,
-} = require("./services/translate");
-const { mergeMeta, recordJob } = require("./services/metadata");
+const { detectLanguage, translateBatch, translateContextual, unloadContextualModel, mapTargetLocale } = require("./services/translate");
+const { assertCueIntegrity, mergeShortCues, finalizeCues, parseTimestamp, preserveDialogueLayout } = require("./services/subtitleQuality");
+const { buildForcedAlignedCues, fetchWordTimestamps } = require("./services/forcedAlignment");
+const { transition } = require("./services/metadata");
 const { inc } = require("./metrics");
+const { assertSafeRemoteUrl } = require("./utils/security");
+const { acquireTorrent } = require("./services/qbittorrent");
 
-const queueName = "subtitle-jobs";
+function clearFailureMarker(sourceId) {
+  fs.rmSync(subtitlePath(sourceId, "failed.json"), { force: true });
+}
 
-// Keeps delayed jobs moving.
-const scheduler = new QueueScheduler(queueName, { connection });
+function cueMilliseconds(cue) {
+  const match = String(cue.time || "").match(/^(\S+)\s+-->\s+(\S+)/);
+  if (!match) return { startMs: null, endMs: null };
+  const start = parseTimestamp(match[1]);
+  const end = parseTimestamp(match[2]);
+  return {
+    startMs: Number.isFinite(start) ? start * 1000 : null,
+    endMs: Number.isFinite(end) ? end * 1000 : null,
+  };
+}
 
-const worker = new Worker(
-  queueName,
-  async (job) => {
-    const { videoKey, targetUrl } = job.data;
-    inc("jobs_total");
-    logger.info("Worker started", {
-      jobId: job.id,
-      videoKey,
-      target: sanitizeUrl(targetUrl),
-    });
+async function extract(mediaInput, source, outputDir) {
+  try {
+    if (/\.m3u8(?:$|\?)/i.test(mediaInput)) return await extractHlsSubtitle(mediaInput, { preferredLangs: config.preferredSubtitleLangs });
+    if (/\.mpd(?:$|\?)/i.test(mediaInput)) return await extractDashSubtitle(mediaInput, { preferredLangs: config.preferredSubtitleLangs });
+    return await extractFileSubtitle(mediaInput, outputDir, config.preferredSubtitleLangs);
+  } catch (error) {
+    transition(source.sourceId, "transcribing", { extractionError: error.message });
+    logger.info("Preparing subtitles", { sourceId: source.sourceId, stage: "transcribing", reason: error.message });
+    return transcribeSource(mediaInput, outputDir, source.sourceId, [source.filename, source.name].filter(Boolean).join(". "));
+  }
+}
 
-    // Skip if already translated.
-    const translatedPath = subtitlePath(videoKey, "pt-auto.vtt");
-    if (fs.existsSync(translatedPath)) {
-      inc("cache_hits");
-      return { status: "cached" };
+async function processJob(job) {
+  const { sourceId } = job.data;
+  inc("jobs_total");
+  const source = sourceStore.get(sourceId);
+  if (!source) throw new Error("Source no longer exists");
+  logger.info("Worker started job", { jobId: job.id, sourceId });
+  ensureSourceDir(sourceId);
+  const outputDir = path.dirname(subtitlePath(sourceId, "pt-BR.vtt"));
+  const finalPath = subtitlePath(sourceId, "pt-BR.vtt");
+  if (fs.existsSync(finalPath)) return { status: "cached" };
+
+  try {
+    let mediaInput = source.localPath && fs.existsSync(source.localPath) ? source.localPath : null;
+    if (!mediaInput && source.infoHash) {
+      transition(sourceId, "acquiring", { progress: 1, downloadProgress: 0 });
+      let lastLoggedPercent = -1;
+      let lastLoggedMessage = null;
+      const acquired = await acquireTorrent(source, async (state) => {
+        transition(sourceId, state.stage, state);
+        await job.updateProgress(state);
+        const percent = Number.isFinite(state.downloadProgress) ? state.downloadProgress : null;
+        if (percent !== null && percent !== lastLoggedPercent) {
+          lastLoggedPercent = percent;
+          logger.info("Torrent download progress", {
+            sourceId,
+            percent,
+            downloadedMiB: Math.round((state.downloadedBytes || 0) / 1048576),
+            totalMiB: Math.round((state.totalBytes || 0) / 1048576),
+            speedMiBps: Number(((state.downloadSpeedBytes || 0) / 1048576).toFixed(2)),
+            etaMinutes: Number.isFinite(state.etaSeconds) ? Math.ceil(state.etaSeconds / 60) : null,
+          });
+        } else if (state.message && state.message !== lastLoggedMessage) {
+          lastLoggedMessage = state.message;
+          logger.info("Torrent acquisition", { sourceId, message: state.message });
+        }
+      });
+      mediaInput = acquired.localPath;
+      sourceStore.upsert({ ...source, ...acquired, acquisitionState: "ready" });
+      logger.info("Torrent download completed", { sourceId, fileName: acquired.fileName, size: acquired.size });
+    } else if (!mediaInput && source.url) {
+      await assertSafeRemoteUrl(source.url);
+      mediaInput = source.url;
     }
+    if (!mediaInput) throw new Error("Source cannot be acquired");
+    transition(sourceId, "probing", { progress: 38 });
+    logger.info("Preparing subtitles", { sourceId, stage: "probing" });
+    const extraction = await extract(mediaInput, source, outputDir);
+    fs.writeFileSync(subtitlePath(sourceId, "original.vtt"), extraction.content, "utf8");
+    transition(sourceId, "synchronizing", { progress: 50, origin: extraction.name, languageDeclared: extraction.lang });
+    const parsedCues = parseVtt(extraction.content);
+    const cues = extraction.name === "faster-whisper" ? mergeShortCues(parsedCues) : parsedCues;
+    if (!cues.length) throw new Error("Subtitle contains no valid cues");
+    // OCR/text tracks can legitimately keep an on-screen sign for longer.
+    // Audio transcription must stay strict because long cues usually mean
+    // Whisper swallowed dialogue and produced a timing hole.
+    const maxCueSeconds = extraction.name === "faster-whisper" ? 20 : 60;
+    const sourceQuality = assertCueIntegrity(cues, { maxCueSeconds });
 
-    ensureVideoDir(videoKey);
-
-    let extraction;
-    let sourceType = "unknown";
-
-    try {
-      if (typeof targetUrl === "string" && targetUrl.includes(".m3u8")) {
-        sourceType = "hls";
-        extraction = await extractHlsSubtitle(targetUrl, {
-          preferredLangs: config.preferredSubtitleLangs,
-        });
-      } else if (typeof targetUrl === "string" && targetUrl.includes(".mpd")) {
-        sourceType = "dash";
-        extraction = await extractDashSubtitle(targetUrl, {
-          preferredLangs: config.preferredSubtitleLangs,
-        });
-      } else {
-        sourceType = "file";
-        extraction = await extractFileSubtitle(
-          targetUrl,
-          path.dirname(translatedPath),
-          config.preferredSubtitleLangs
-        );
-      }
-    } catch (err) {
-      inc("extraction_failed");
-      await savePlaceholderSubtitle(videoKey);
-      recordJob(videoKey, { status: "failed", reason: err.message });
-      throw err;
-    }
-
-    recordJob(videoKey, { status: "extracted", sourceType });
-    const originalPath = subtitlePath(videoKey, "original.vtt");
-    fs.writeFileSync(originalPath, extraction.content, "utf8");
-
-    // 2) Parsear cues
-    const cues = parseVtt(extraction.content);
-    if (!cues.length) {
-      await savePlaceholderSubtitle(videoKey);
-      throw new Error("Legenda vazia ou ilegível");
-    }
-
-    // 3) Detectar idioma
-    const sampleText = cues
-      .slice(0, 10)
-      .map((c) => c.text)
-      .join("\n")
-      .slice(0, 4000);
-    const detected = await detectLanguage(sampleText, config.libreTranslateUrl);
-    logger.info("Idioma detectado", { detected, declared: extraction.lang });
-
-    const isPortuguese =
-      detected.startsWith("pt") || (extraction.lang || "").startsWith("pt");
-    mergeMeta(videoKey, {
-      sourceType,
-      langDetected: detected,
-      langDeclared: extraction.lang || "und",
-    });
-
+    transition(sourceId, "contextualizing", { progress: 55 });
+    const sample = cues.slice(0, 20).map((cue) => cue.text).join("\n").slice(0, 4000);
+    const detected = await detectLanguage(sample, config.libreTranslateUrl);
+    const isPortuguese = detected.startsWith("pt") || detected === "pb" || /^(pt|pb)/i.test(String(extraction.lang || ""));
     if (isPortuguese) {
-      // Apenas normaliza para pt-auto.
-      fs.writeFileSync(translatedPath, extraction.content, "utf8");
-      recordJob(videoKey, { status: "ready", translated: false });
-      return { status: "pass-through", lang: detected };
+      const finalized = finalizeCues(cues);
+      fs.writeFileSync(finalPath, serializeVtt(finalized), "utf8");
+      clearFailureMarker(sourceId);
+      transition(sourceId, "ready", { progress: 100, translated: false, languageDetected: detected, cues: finalized.length, origin: extraction.name, sourceQuality });
+      return { status: "ready", translated: false, cues: finalized.length };
     }
 
-    // 4) Traduzir cue a cue
-    const translatedTexts = await translateBatch(
-      cues.map((c) => c.text),
-      config.libreTranslateUrl,
-      config.targetLocale,
-      detected,
-      config.translateBatchChars
-    );
-
-    const translatedCues = cues.map((cue, idx) => ({
-      ...cue,
-      text: translatedTexts[idx] || cue.text,
-    }));
-
-    const translatedVtt = serializeVtt(translatedCues);
-    fs.writeFileSync(translatedPath, translatedVtt, "utf8");
+    transition(sourceId, "translating", { progress: 65, languageDetected: detected });
+    logger.info("Preparing subtitles", { sourceId, stage: "translating", languageDetected: detected });
+    const sourceTexts = cues.map((cue) => String(cue.text || "").replace(/\s*\n\s*/g, " ").replace(/\s+/g, " ").trim());
+    const contextualInput = cues.map((cue, index) => ({ text: sourceTexts[index], ...cueMilliseconds(cue) }));
+    let forcedAlignment = null;
+    if (config.forcedAlignmentEnabled && config.intelligenceUrl && extraction.name !== "faster-whisper") {
+      transition(sourceId, "aligning", { progress: 60 });
+      logger.info("Aligning official subtitles to spoken audio", { sourceId, language: detected });
+      try {
+        forcedAlignment = await fetchWordTimestamps(mediaInput, outputDir, sourceId, {
+          endpoint: config.intelligenceUrl,
+          language: detected.startsWith("en") ? "en" : detected,
+          prompt: [source.filename, source.title, source.name].filter(Boolean).join(". "),
+          timeoutMs: config.forcedAlignmentTimeoutMs,
+        });
+      } catch (error) {
+        logger.warn("Forced alignment unavailable; preserving official cue timing", { sourceId, error: error.message });
+      }
+      transition(sourceId, "translating", { progress: 65, languageDetected: detected });
+    }
+    await releaseTranscriptionModel();
+    let texts;
+    let translationProvider = `ollama:${config.contextualTranslatorModel}`;
+    try {
+      texts = await translateContextual(contextualInput, {
+        endpoint: config.contextualTranslatorUrl,
+        model: config.contextualTranslatorModel,
+        sourceLang: detected,
+        targetLocale: config.targetLocale,
+        contextTitle: [source.filename, source.title, source.name].filter(Boolean).join(" · ").slice(0, 1000),
+        maxChars: config.translateBatchChars,
+        maxCues: config.contextualTranslatorMaxCues,
+        timeoutMs: config.contextualTranslatorTimeoutMs,
+      });
+    } catch (error) {
+      if (!config.allowLiteralTranslationFallback) throw new Error(`Tradução contextual falhou; legenda literal não será publicada: ${error.message}`);
+      logger.warn("Using explicitly enabled literal translation fallback", { sourceId, error: error.message });
+      translationProvider = "libretranslate-fallback";
+      texts = await translateBatch(sourceTexts, config.libreTranslateUrl, config.targetLocale, detected, config.translateBatchChars);
+    } finally {
+      await unloadContextualModel(config.contextualTranslatorUrl, config.contextualTranslatorModel);
+    }
+    if (texts.length !== cues.length) throw new Error("Translator changed cue count");
+    texts = texts.map((text, index) => preserveDialogueLayout(cues[index].text, text));
+    let translated;
+    let alignmentQuality = null;
+    if (forcedAlignment?.words?.length) {
+      const aligned = buildForcedAlignedCues(cues, texts, forcedAlignment.words);
+      translated = aligned.cues;
+      alignmentQuality = {
+        ...aligned.stats,
+        audioStream: forcedAlignment.audioStream,
+        audioLanguage: forcedAlignment.audioLanguage,
+        detectedWords: forcedAlignment.words.length,
+      };
+    } else {
+      translated = finalizeCues(cues.map((cue, index) => ({ ...cue, text: texts[index] })));
+    }
+    transition(sourceId, "validating", { progress: 95 });
+    const vtt = serializeVtt(translated);
+    const validatedCues = parseVtt(vtt);
+    if (validatedCues.length !== translated.length) {
+      fs.writeFileSync(subtitlePath(sourceId, "validation-debug.vtt"), vtt, "utf8");
+      throw new Error(`Final VTT validation failed: expected ${translated.length} cues, parsed ${validatedCues.length}`);
+    }
+    const finalQuality = assertCueIntegrity(validatedCues, { maxCueSeconds });
+    fs.writeFileSync(finalPath, vtt, "utf8");
+    clearFailureMarker(sourceId);
     inc("translations_total");
-    recordJob(videoKey, {
-      status: "ready",
+    transition(sourceId, "ready", {
+      progress: 100,
       translated: true,
       from: detected,
       to: mapTargetLocale(config.targetLocale),
+      cues: translated.length,
+      origin: extraction.name,
+      translationProvider,
+      alignmentQuality,
+      sourceQuality,
+      finalQuality,
     });
-
-    return {
-      status: "translated",
-      from: detected,
-      to: mapTargetLocale(config.targetLocale),
-      cues: translatedCues.length,
-    };
-  },
-  {
-    connection,
-    concurrency: config.job.concurrency,
+    return { status: "ready", translated: true, cues: translated.length };
+  } catch (error) {
+    fs.writeFileSync(subtitlePath(sourceId, "failed.json"), JSON.stringify({ message: error.message, at: new Date().toISOString() }), "utf8");
+    transition(sourceId, "failed", { error: error.message });
+    throw error;
   }
-);
+}
 
-worker.on("completed", (job, result) => {
-  logger.info("Worker completed", { jobId: job.id, result });
+const connection = getConnection();
+const worker = new Worker("subtitle-jobs", processJob, {
+  connection,
+  concurrency: config.job.concurrency,
+  limiter: { max: config.job.rateLimit, duration: 1000 },
+  // PGS OCR can saturate the CPU for several minutes. A longer lease prevents
+  // BullMQ from treating a healthy job as stalled while keeping lock renewal.
+  lockDuration: config.job.lockDurationMs,
 });
 
-worker.on("failed", (job, err) => {
-  logger.error("Worker failed", { jobId: job?.id, err: err.message });
-  inc("jobs_failed");
-});
+worker.on("completed", (job, result) => logger.info("Worker completed", { jobId: job.id, result }));
+worker.on("failed", (job, error) => { inc("jobs_failed"); logger.error("Worker failed", { jobId: job?.id, error: error.message }); });
 
-process.on("SIGINT", async () => {
+async function shutdown() {
   await worker.close();
-  await scheduler.close();
   await connection.quit();
-  process.exit(0);
-});
+}
+process.once("SIGINT", () => shutdown().finally(() => process.exit(0)));
+process.once("SIGTERM", () => shutdown().finally(() => process.exit(0)));
 
-process.on("SIGTERM", async () => {
-  await worker.close();
-  await scheduler.close();
-  await connection.quit();
-  process.exit(0);
-});
+module.exports = { processJob };

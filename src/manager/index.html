@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#0b0d0f">
+  <title>PT-AUTO · Gerenciador</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="noise"></div>
+  <div id="auth" class="auth-screen">
+    <form id="login-form" class="auth-card">
+      <div class="brand-mark">PT</div>
+      <p class="eyebrow">ACESSO PROTEGIDO</p>
+      <h1>Seu conteúdo,<br>sob controle.</h1>
+      <p class="muted">Use o mesmo ADMIN_TOKEN configurado no arquivo .env do add-on.</p>
+      <label>Token de administrador<input id="token" type="password" autocomplete="current-password" placeholder="Cole seu token" required></label>
+      <button class="primary" type="submit">Entrar no gerenciador</button>
+      <p id="login-error" class="form-error"></p>
+    </form>
+  </div>
+
+  <div id="app" class="shell" hidden>
+    <aside class="sidebar">
+      <a class="brand" href="#overview"><span class="brand-mark small">PT</span><span><b>PT-AUTO</b><small>MEDIA DESK</small></span></a>
+      <nav>
+        <button class="nav-item active" data-view="overview">Visão geral</button>
+        <button class="nav-item" data-view="library">Assistindo</button>
+        <button class="nav-item" data-view="subtitles">Legendas</button>
+        <button class="nav-item" data-view="logs">Erros e logs <span id="error-badge" class="badge">0</span></button>
+      </nav>
+      <div class="sidebar-foot">
+        <div class="health"><i></i><span>Serviço conectado</span></div>
+        <button id="logout" class="text-button">Sair</button>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div><p class="eyebrow">CENTRAL DE CONTROLE</p><h2 id="view-title">Visão geral</h2></div>
+        <div class="top-actions"><span id="updated" class="muted"></span><button id="refresh" class="secondary">Atualizar</button></div>
+      </header>
+
+      <section id="overview-view" class="view active">
+        <div id="stats" class="stats"></div>
+        <div class="section-head"><div><p class="eyebrow">CONTINUE DE ONDE PAROU</p><h3>Assistindo agora</h3></div><button class="text-button go-library">Ver biblioteca</button></div>
+        <div id="continue-grid" class="continue-grid"></div>
+        <div class="two-columns">
+          <article class="panel"><div class="panel-head"><div><p class="eyebrow">ATIVIDADE</p><h3>Preparação recente</h3></div></div><div id="recent-jobs" class="job-list"></div></article>
+          <article class="panel"><div class="panel-head"><div><p class="eyebrow">ATENÇÃO</p><h3>Problemas recentes</h3></div><button class="text-button go-logs">Abrir logs</button></div><div id="recent-errors" class="error-list"></div></article>
+        </div>
+      </section>
+
+      <section id="library-view" class="view">
+        <div class="toolbar"><div class="segmented"><button class="active" data-filter="all">Todos</button><button data-filter="watching">Assistindo</button><button data-filter="paused">Pausados</button><button data-filter="completed">Concluídos</button></div><input id="search" class="search" placeholder="Buscar série, filme ou episódio"></div>
+        <div id="library" class="library"></div>
+      </section>
+
+      <section id="subtitles-view" class="view">
+        <div class="section-head"><div><p class="eyebrow">RASTREABILIDADE</p><h3>Legendas criadas</h3><p class="muted">Veja de onde vieram, como foram traduzidas e se passaram pela validação.</p></div></div>
+        <div id="subtitle-list" class="subtitle-list"></div>
+      </section>
+
+      <section id="logs-view" class="view">
+        <div class="toolbar"><div class="segmented"><button class="active" data-level="">Todos</button><button data-level="error">Erros</button><button data-level="warn">Alertas</button><button data-level="info">Informações</button></div><button id="copy-logs" class="secondary">Copiar logs visíveis</button></div>
+        <div id="logs" class="logs"></div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="confirm-dialog">
+    <form method="dialog" class="dialog-card"><p class="eyebrow">CONFIRMAR AÇÃO</p><h3 id="confirm-title">Apagar conteúdo?</h3><p id="confirm-text" class="muted"></p><div class="dialog-actions"><button value="cancel" class="secondary">Cancelar</button><button id="confirm-action" value="confirm" class="danger">Apagar</button></div></form>
+  </dialog>
+  <div id="toast" class="toast" aria-live="polite"></div>
+  <script src="app.js" defer></script>
+</body>
+</html>

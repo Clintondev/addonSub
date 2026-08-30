@@ -94,8 +94,8 @@ async function downloadVttFromM3u8(uri, baseUrl, maxSegments = 300) {
   for (const seg of segments) {
     try {
       const segText = await fetchText(seg);
-      // Ensure spacing between segments.
-      output += `${segText.trim()}\n\n`;
+      const withoutHeader = segText.replace(/^\uFEFF?WEBVTT[^\r\n]*(?:\r?\n)+/i, "").trim();
+      output += `${withoutHeader}\n\n`;
     } catch (err) {
       logger.warn("Failed to fetch subtitle segment", {
         segment: sanitizeUrl(seg),

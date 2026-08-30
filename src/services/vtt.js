@@ -16,13 +16,13 @@ function parseVtt(text) {
     let id = null;
     let startIdx = i;
     const possibleId = lines[i].trim();
-    const isTimestampLine = possibleId.includes("-->");
+    const isTimestampLine = /^\d+:\d{2}:\d{2}\.\d{3}\s+-->\s+\d+:\d{2}:\d{2}\.\d{3}(?:\s|$)/.test(possibleId);
     if (!isTimestampLine) {
       id = possibleId;
       i++;
     }
 
-    if (i >= lines.length || !lines[i].includes("-->")) {
+    if (i >= lines.length || !/^\d+:\d{2}:\d{2}\.\d{3}\s+-->\s+\d+:\d{2}:\d{2}\.\d{3}(?:\s|$)/.test(lines[i].trim())) {
       // malformed; skip to next blank.
       while (i < lines.length && lines[i].trim() !== "") i++;
       continue;

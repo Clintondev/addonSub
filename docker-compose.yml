@@ -1,32 +1,155 @@
-version: "3.9"
-
 services:
   addon:
     build: .
-    container_name: stremio-pt-auto-addon
-    env_file:
-      - .env
-    ports:
-      - "7000:7000"
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
+    ports: ["7000:7000"]
     volumes:
-      - .:/usr/src/app
+      - ./storage:/usr/src/app/storage
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    depends_on:
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:7000/healthz').then(r=>{if(!r.ok)process.exit(1)})"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: ["tunnel", "--no-autoupdate", "run", "--token", "${CLOUDFLARE_TUNNEL_TOKEN}"]
+    depends_on:
+      addon: { condition: service_healthy }
+
+  media-worker:
+    build: .
+    restart: unless-stopped
+    env_file: [.env]
+    command: ["npm", "run", "worker"]
+    volumes:
       - ./storage:/usr/src/app/storage
     depends_on:
-      - redis
-      - libretranslate
-    command: sh -c "npm install && npm run start"
+      redis: { condition: service_healthy }
+      intelligence: { condition: service_healthy }
+      ollama-init: { condition: service_completed_successfully }
+      libretranslate: { condition: service_healthy }
+      qbittorrent: { condition: service_healthy }
+
+  qbittorrent:
+    build: ./torrent
+    restart: unless-stopped
+    volumes:
+      - ./storage/media:/downloads
+      - qbittorrent-config:/config
+    ports:
+      - "6881:6881/tcp"
+      - "6881:6881/udp"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/v2/app/version"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  intelligence:
+    build: ./intelligence
+    restart: unless-stopped
+    environment:
+      STORAGE_DIR: /usr/src/app/storage
+      WHISPER_MODEL: ${WHISPER_MODEL:-large-v3}
+      WHISPER_DEVICE: ${WHISPER_DEVICE:-cuda}
+      WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-float16}
+      WHISPER_VAD_THRESHOLD: ${WHISPER_VAD_THRESHOLD:-0.35}
+      WHISPER_VAD_MIN_SPEECH_MS: ${WHISPER_VAD_MIN_SPEECH_MS:-120}
+      WHISPER_VAD_MIN_SILENCE_MS: ${WHISPER_VAD_MIN_SILENCE_MS:-700}
+      WHISPER_VAD_SPEECH_PAD_MS: ${WHISPER_VAD_SPEECH_PAD_MS:-500}
+      WHISPER_BEAM_SIZE: ${WHISPER_BEAM_SIZE:-5}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    volumes:
+      - ./storage:/usr/src/app/storage
+      - whisper-models:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    environment:
+      OLLAMA_KEEP_ALIVE: "0"
+    volumes:
+      - ollama-models:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  ollama-init:
+    image: ollama/ollama:latest
+    restart: "no"
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    command: ["pull", "${CONTEXTUAL_TRANSLATOR_MODEL:-translategemma:12b}"]
+    volumes:
+      - ollama-models:/root/.ollama
+    depends_on:
+      ollama: { condition: service_healthy }
 
   redis:
-    image: redis:7
-    container_name: stremio-pt-auto-redis
+    image: redis:7-alpine
     restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: ["redis-data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   libretranslate:
     image: libretranslate/libretranslate:latest
-    container_name: stremio-pt-auto-libretranslate
     restart: unless-stopped
     environment:
-      - LT_API_KEY=none
-    ports:
-      - "5000:5000"
+      LT_LOAD_ONLY: en,pt,pb
+      LT_UPDATE_MODELS: "true"
+      LT_DISABLE_WEB_UI: "true"
+    volumes:
+      - libretranslate-models:/home/libretranslate/.local
+    healthcheck:
+      test: ["CMD-SHELL", "./venv/bin/python scripts/healthcheck.py"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
 
+volumes:
+  redis-data:
+  libretranslate-models:
+  qbittorrent-config:
+  whisper-models:
+  ollama-models:
