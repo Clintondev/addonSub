@@ -18,3 +18,10 @@ test("does not mistake arrows in subtitle text for timestamps", () => {
   assert.equal(cues.length, 2);
   assert.equal(cues[0].text, "Plano A --> Plano B");
 });
+
+test("normalizes FFmpeg WebVTT timestamps that omit the hour", () => {
+  const cues = parseVtt("WEBVTT\n\n00:26.068 --> 00:27.903\nThat's it.\n");
+  assert.equal(cues.length, 1);
+  assert.equal(cues[0].time, "00:00:26.068 --> 00:00:27.903");
+  assert.equal(cues[0].text, "That's it.");
+});

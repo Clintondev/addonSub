@@ -95,22 +95,25 @@ function mergeShortCues(cues, { maxChars = 105, maxGapSeconds = 0.65, minDuratio
 
 function displayChunks(text, maxLineChars = 42, maxLines = 2) {
   const turns = dialogueTurns(text);
-  if (turns.length > 1 && turns.length <= maxLines && turns.every((line) => line.length + 2 <= Math.max(maxLineChars, 48))) {
-    return [turns.map((line) => `- ${line}`).join("\n")];
-  }
-  const words = plainText(text).split(" ").filter(Boolean);
-  if (!words.length) return [""];
-  const lines = [];
-  let line = "";
-  for (const word of words) {
-    if (line && `${line} ${word}`.length > maxLineChars) {
-      lines.push(line);
-      line = word;
-    } else {
-      line = line ? `${line} ${word}` : word;
+  const wrapLines = (value) => {
+    const words = plainText(value).split(" ").filter(Boolean);
+    if (!words.length) return [""];
+    const output = [];
+    let line = "";
+    for (const word of words) {
+      if (line && `${line} ${word}`.length > maxLineChars) {
+        output.push(line);
+        line = word;
+      } else {
+        line = line ? `${line} ${word}` : word;
+      }
     }
-  }
-  if (line) lines.push(line);
+    if (line) output.push(line);
+    return output;
+  };
+  const lines = turns.length > 1
+    ? turns.flatMap((turn) => wrapLines(`- ${turn}`))
+    : wrapLines(text);
   const chunks = [];
   for (let index = 0; index < lines.length; index += maxLines) chunks.push(lines.slice(index, index + maxLines).join("\n"));
   return chunks;
@@ -145,8 +148,8 @@ function finalizeCues(cues, { targetCps = 17, minDurationSeconds = 1, maxDuratio
   });
 }
 
-function analyzeCueIntegrity(cues, { maxCueSeconds = 20 } = {}) {
-  const stats = { cues: cues.length, invalid: 0, empty: 0, overlaps: 0, longCues: 0, maxGapSeconds: 0, maxCueSeconds: 0 };
+function analyzeCueIntegrity(cues, { maxCueSeconds = 20, maxLineChars = null } = {}) {
+  const stats = { cues: cues.length, invalid: 0, empty: 0, overlaps: 0, longCues: 0, overlongLines: 0, maxLineChars: 0, maxGapSeconds: 0, maxCueSeconds: 0 };
   let previousEnd = null;
   for (const cue of cues) {
     const timing = cueTiming(cue);
@@ -155,6 +158,10 @@ function analyzeCueIntegrity(cues, { maxCueSeconds = 20 } = {}) {
       continue;
     }
     if (!plainText(cue.text)) stats.empty++;
+    for (const line of String(cue.text || "").split("\n")) {
+      stats.maxLineChars = Math.max(stats.maxLineChars, line.length);
+      if (Number.isFinite(maxLineChars) && line.length > maxLineChars) stats.overlongLines++;
+    }
     const duration = timing.end - timing.start;
     stats.maxCueSeconds = Math.max(stats.maxCueSeconds, duration);
     if (duration > maxCueSeconds) stats.longCues++;
@@ -173,13 +180,33 @@ function assertCueIntegrity(cues, options) {
   if (stats.invalid) throw new Error(`Legenda contém ${stats.invalid} marcações de tempo inválidas`);
   if (stats.empty) throw new Error(`Legenda contém ${stats.empty} falas vazias`);
   if (stats.longCues) throw new Error(`Legenda contém ${stats.longCues} falas com duração anormal (máximo ${stats.maxCueSeconds.toFixed(1)}s)`);
+  if (stats.overlongLines) throw new Error(`Legenda contém ${stats.overlongLines} linhas acima de ${options.maxLineChars} caracteres (máximo ${stats.maxLineChars})`);
   if (stats.overlaps > Math.max(2, Math.ceil(stats.cues * 0.01))) throw new Error(`Legenda contém sobreposições excessivas (${stats.overlaps})`);
   return stats;
+}
+
+function removeEmptyCues(cues) {
+  return cues.filter((cue) => plainText(cue.text));
+}
+
+function assertSubtitleCompleteness(cues, mediaDurationSeconds, { minimumCuesPerMinute = 2, minimumSpanRatio = 0.5 } = {}) {
+  const duration = Number(mediaDurationSeconds);
+  if (!Number.isFinite(duration) || duration < 600) return { cues: cues.length, spanRatio: null };
+  const timings = cues.map(cueTiming).filter(Boolean);
+  const minimumCues = Math.max(20, Math.floor(duration / 60 * minimumCuesPerMinute));
+  const first = timings.length ? Math.min(...timings.map((timing) => timing.start)) : 0;
+  const last = timings.length ? Math.max(...timings.map((timing) => timing.end)) : 0;
+  const spanRatio = Math.max(0, last - first) / duration;
+  if (cues.length < minimumCues || spanRatio < minimumSpanRatio) {
+    throw new Error(`Legenda embutida incompleta: ${cues.length} falas, cobertura ${(spanRatio * 100).toFixed(1)}%`);
+  }
+  return { cues: cues.length, minimumCues, spanRatio };
 }
 
 module.exports = {
   analyzeCueIntegrity,
   assertCueIntegrity,
+  assertSubtitleCompleteness,
   displayChunks,
   finalizeCues,
   formatTimestamp,
@@ -188,4 +215,5 @@ module.exports = {
   parseTimestamp,
   dialogueTurns,
   preserveDialogueLayout,
+  removeEmptyCues,
 };

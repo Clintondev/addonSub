@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { chooseFile, isPausedState, torrentStorageRoot } = require("../src/services/qbittorrent");
+const { chooseFile, isPausedState, torrentStorageRoot, torrentFilePathCandidates } = require("../src/services/qbittorrent");
 
 const files = [
   { index: 0, name: "sample.txt", size: 5000 },
@@ -26,4 +26,12 @@ test("recognizes qBittorrent paused and stopped states", () => {
 test("reuses the actual storage folder of an existing torrent", () => {
   const root = torrentStorageRoot({ save_path: "/downloads/src_existing" }, "src_new");
   assert.match(root.replace(/\\/g, "/"), /storage\/media\/src_existing$/);
+});
+
+test("looks inside qBittorrent content_path for files from multi-file torrents", () => {
+  const candidates = torrentFilePathCandidates({
+    save_path: "/downloads/src_episode",
+    content_path: "/downloads/src_episode/Season Pack",
+  }, "src_episode", "Episode 01.mkv").map((candidate) => candidate.replace(/\\/g, "/"));
+  assert.ok(candidates.some((candidate) => candidate.endsWith("/storage/media/src_episode/Season Pack/Episode 01.mkv")));
 });

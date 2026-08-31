@@ -84,7 +84,7 @@ function libraryView(allSources = sourceStore.list({ limit: 5000 })) {
     if (!groups.has(item.imdbId)) groups.set(item.imdbId, { imdbId: item.imdbId, type: item.type, title: item.imdbId, sourceByVideo: new Map() });
   }
   return [...groups.values()].map((group) => {
-    const watch = watching.get(group.imdbId) || { status: "library", prefetchAhead: config.prefetch.ahead };
+    const watch = watching.get(group.imdbId) || { status: "library", prefetchAhead: 0 };
     group.episodes = [...group.sourceByVideo.values()].map((item) => episodeView(item.source));
     delete group.sourceByVideo;
     group.episodes.sort((a, b) => (a.season || 0) - (b.season || 0) || (a.episode || 0) - (b.episode || 0));

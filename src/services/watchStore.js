@@ -40,7 +40,7 @@ function markPlayback(source) {
     status: current.status === "completed" ? "watching" : (current.status || "watching"),
     currentVideoId: source.videoId,
     currentSourceId: source.sourceId,
-    prefetchAhead: Number.isInteger(current.prefetchAhead) ? current.prefetchAhead : config.prefetch.ahead,
+    prefetchAhead: Number.isInteger(current.prefetchAhead) ? current.prefetchAhead : 0,
     playCount: (current.playCount || 0) + 1,
     firstPlayedAt: current.firstPlayedAt || new Date().toISOString(),
     lastPlayedAt: new Date().toISOString(),
@@ -51,7 +51,7 @@ function markPlayback(source) {
 
 function update(imdbId, patch) {
   const state = readState();
-  const current = state.items[imdbId] || { imdbId, status: "watching", prefetchAhead: config.prefetch.ahead };
+  const current = state.items[imdbId] || { imdbId, status: "watching", prefetchAhead: 0 };
   state.items[imdbId] = { ...current, ...patch, imdbId, updatedAt: new Date().toISOString() };
   persist(state);
   return state.items[imdbId];

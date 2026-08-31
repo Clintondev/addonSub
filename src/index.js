@@ -31,13 +31,24 @@ function buildManifest() {
   };
 }
 
+function externalSubtitleView(record, status, { includeAddon = false } = {}) {
+  const ready = status.status === "ready";
+  return {
+    // Bump the id when changing the advertised format so Stremio does not
+    // reuse a cached ASS URL from an older subtitle response.
+    id: `pt-auto-vtt-v3-${record.sourceId}`,
+    lang: "por",
+    name: ready
+      ? `PT-AUTO · compatível${includeAddon ? ` · ${record.addonName}` : ""}`
+      : "PT-AUTO (preparando)",
+    url: ready ? status.url : subtitleUrl(record.sourceId, "pending.vtt"),
+  };
+}
+
 function streamView(item, mode = "direct", options = {}) {
   const { stream, record } = item;
   const status = translationStatus(record.sourceId);
   const localReady = Boolean(record.localPath && fs.existsSync(record.localPath));
-  const fileName = status.status === "ready"
-    ? mode === "direct" && status.assPath ? "pt-BR.ass" : "pt-BR.vtt"
-    : "pending.vtt";
   if (status.status !== "ready" && options.savePending !== false) savePendingSubtitle(record.sourceId).catch(() => {});
   const behaviorHints = { ...(stream.behaviorHints || {}), bingeGroup: stream.behaviorHints?.bingeGroup || `pt-auto-${record.sourceId}` };
   if (mode === "hls") delete behaviorHints.filename;
@@ -56,12 +67,7 @@ function streamView(item, mode = "direct", options = {}) {
           ? `Primeiro clique baixa e prepara · ${stream.title || stream.name || record.filename || "Stream"}`
           : stream.title || stream.name || record.filename || "Stream",
     behaviorHints,
-    subtitles: [{
-      id: `pt-auto-layout-v2-${record.sourceId}`,
-      lang: "por",
-      name: status.status === "ready" ? "PT-AUTO · posição original" : "PT-AUTO (preparando)",
-      url: subtitleUrl(record.sourceId, fileName),
-    }],
+    subtitles: [externalSubtitleView(record, status)],
   };
   if (mode === "hls") {
     delete result.infoHash;
@@ -132,12 +138,7 @@ function createAddonRouter() {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
     const subtitles = sourceStore.list({ videoId: id }).map((source) => ({ source, status: translationStatus(source.sourceId) }))
       .filter(({ status }) => status.status === "ready")
-      .map(({ source, status }) => ({
-        id: `pt-auto-layout-v2-${source.sourceId}`,
-        lang: "por",
-        name: `PT-AUTO · posição original · ${source.addonName}`,
-        url: status.assUrl || status.url,
-      }));
+      .map(({ source, status }) => externalSubtitleView(source, status, { includeAddon: true }));
     res.json({ subtitles });
   };
   router.get("/subtitles/:type/:id/:extra.json", subtitlesHandler);
@@ -206,7 +207,6 @@ function createApp() {
     const source = sourceStore.get(req.params.sourceId);
     if (!source) return res.status(404).send("Source not found");
     watchStore.markPlayback(source);
-    scheduleSeriesPrefetch(source.sourceId).catch((error) => logger.warn("Series prefetch failed", { sourceId: source.sourceId, error: error.message }));
     if (source.localPath && fs.existsSync(source.localPath)) return serveLocalMedia(req, res, source.localPath);
     queueTranslationJob(source.sourceId, 1).catch((error) => logger.error("Failed to enqueue selected source", { sourceId: source.sourceId, error: error.message }));
     res.setHeader("Cache-Control", "no-store");
@@ -222,7 +222,6 @@ function createApp() {
     const source = sourceStore.get(req.params.sourceId);
     if (!source) return res.status(404).send("Source not found");
     watchStore.markPlayback(source);
-    scheduleSeriesPrefetch(source.sourceId).catch((error) => logger.warn("Series prefetch failed", { sourceId: source.sourceId, error: error.message }));
     if (!source.localPath || !fs.existsSync(source.localPath)) {
       queueTranslationJob(source.sourceId, 1).catch((error) => logger.error("Failed to prepare HLS source", { sourceId: source.sourceId, error: error.message }));
       res.setHeader("Retry-After", "30");
@@ -341,7 +340,7 @@ function createApp() {
         shows,
         storage: manager.storageView(shows, allSources.length),
         recentErrors: logs.filter((entry) => ["warn", "error"].includes(entry.level)).slice(0, 12),
-        settings: { defaultPrefetchAhead: config.prefetch.ahead, maxPrefetchAhead: 12, targetLocale: config.targetLocale },
+        settings: { defaultPrefetchAhead: 0, maxPrefetchAhead: 12, targetLocale: config.targetLocale },
       });
     } catch (error) { next(error); }
   });
@@ -439,5 +438,6 @@ module.exports = {
   createApp,
   streamView,
   streamViews,
+  externalSubtitleView,
   subtitleDurationSeconds,
 };

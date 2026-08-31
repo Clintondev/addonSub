@@ -104,8 +104,8 @@ As principais opções estão em `.env.example`:
 - `BASE_URL`: use `http://localhost:7000` quando o Stremio estiver no mesmo computador.
 - `HLS_VIDEO_BITRATE_KBPS` e `HLS_MAX_HEIGHT`: qualidade máxima da opção compatível com navegador.
 - `HLS_CACHE_MAX_AGE_HOURS`: tempo de retenção dos segmentos HLS gerados.
-- `SERIES_PREFETCH_ENABLED`: ativa a preparação antecipada de séries.
-- `SERIES_PREFETCH_AHEAD`: quantidade seguinte à atual; o padrão `4` mantém uma janela total de cinco episódios.
+- `SERIES_PREFETCH_ENABLED`: permite a preparação antecipada quando solicitada pelo gerenciador.
+- `SERIES_PREFETCH_AHEAD`: quantidade escolhida no gerenciador; o padrão `0` não baixa episódios automaticamente.
 - `SERIES_PREFETCH_PRIORITY`: prioridade inferior usada pelos trabalhos antecipados.
 - `CINEMETA_URL`: catálogo utilizado para atravessar corretamente episódios e finais de temporada.
 

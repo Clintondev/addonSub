@@ -12,12 +12,14 @@ const { extractFileSubtitle } = require("./services/ffextract");
 const { releaseTranscriptionModel, transcribeSource } = require("./services/transcribe");
 const { parseVtt, serializeVtt } = require("./services/vtt");
 const { detectLanguage, translateBatch, translateContextual, unloadContextualModel, mapTargetLocale } = require("./services/translate");
-const { assertCueIntegrity, mergeShortCues, finalizeCues, parseTimestamp, preserveDialogueLayout } = require("./services/subtitleQuality");
+const { assertCueIntegrity, assertSubtitleCompleteness, mergeShortCues, finalizeCues, parseTimestamp, preserveDialogueLayout, removeEmptyCues } = require("./services/subtitleQuality");
 const { buildForcedAlignedCues, fetchWordTimestamps } = require("./services/forcedAlignment");
 const { transition } = require("./services/metadata");
 const { inc } = require("./metrics");
 const { assertSafeRemoteUrl } = require("./utils/security");
 const { acquireTorrent } = require("./services/qbittorrent");
+const { validateLocalMedia } = require("./services/mediaValidation");
+const { recoverCorruptMedia } = require("./services/mediaRecovery");
 
 function clearFailureMarker(sourceId) {
   fs.rmSync(subtitlePath(sourceId, "failed.json"), { force: true });
@@ -49,16 +51,26 @@ async function extract(mediaInput, source, outputDir) {
 async function processJob(job) {
   const { sourceId } = job.data;
   inc("jobs_total");
-  const source = sourceStore.get(sourceId);
+  let source = sourceStore.get(sourceId);
   if (!source) throw new Error("Source no longer exists");
   logger.info("Worker started job", { jobId: job.id, sourceId });
   ensureSourceDir(sourceId);
   const outputDir = path.dirname(subtitlePath(sourceId, "pt-BR.vtt"));
   const finalPath = subtitlePath(sourceId, "pt-BR.vtt");
-  if (fs.existsSync(finalPath)) return { status: "cached" };
-
   try {
-    let mediaInput = source.localPath && fs.existsSync(source.localPath) ? source.localPath : null;
+    let mediaInput = source.localPath || null;
+    let mediaDuration = null;
+    if (mediaInput) {
+      const validation = validateLocalMedia(mediaInput);
+      if (!validation.valid) {
+        source = await recoverCorruptMedia(source, validation, async (state) => {
+          transition(sourceId, "recovering", { ...state, mediaRecoveryAttempts: Number(require("./services/metadata").readMeta(sourceId).mediaRecoveryAttempts || 1) });
+          await job.updateProgress(state);
+        });
+        mediaInput = source.localPath;
+      } else mediaDuration = validation.duration;
+    }
+    if (fs.existsSync(finalPath)) return { status: "cached" };
     if (!mediaInput && source.infoHash) {
       transition(sourceId, "acquiring", { progress: 1, downloadProgress: 0 });
       let lastLoggedPercent = -1;
@@ -85,6 +97,15 @@ async function processJob(job) {
       mediaInput = acquired.localPath;
       sourceStore.upsert({ ...source, ...acquired, acquisitionState: "ready" });
       logger.info("Torrent download completed", { sourceId, fileName: acquired.fileName, size: acquired.size });
+      const validation = validateLocalMedia(mediaInput);
+      if (!validation.valid) {
+        source = await recoverCorruptMedia({ ...source, ...acquired, localPath: mediaInput }, validation, async (state) => {
+          transition(sourceId, "recovering", state);
+          await job.updateProgress(state);
+        });
+        mediaInput = source.localPath;
+        mediaDuration = validateLocalMedia(mediaInput).duration;
+      } else mediaDuration = validation.duration;
     } else if (!mediaInput && source.url) {
       await assertSafeRemoteUrl(source.url);
       mediaInput = source.url;
@@ -92,10 +113,22 @@ async function processJob(job) {
     if (!mediaInput) throw new Error("Source cannot be acquired");
     transition(sourceId, "probing", { progress: 38 });
     logger.info("Preparing subtitles", { sourceId, stage: "probing" });
-    const extraction = await extract(mediaInput, source, outputDir);
+    let extraction = await extract(mediaInput, source, outputDir);
     fs.writeFileSync(subtitlePath(sourceId, "original.vtt"), extraction.content, "utf8");
     transition(sourceId, "synchronizing", { progress: 50, origin: extraction.name, languageDeclared: extraction.lang });
-    const parsedCues = parseVtt(extraction.content);
+    let parsedCues = removeEmptyCues(parseVtt(extraction.content));
+    if (extraction.name !== "faster-whisper") {
+      try {
+        assertSubtitleCompleteness(parsedCues, mediaDuration);
+      } catch (error) {
+        logger.warn("Embedded subtitle is incomplete; transcribing full audio instead", { sourceId, error: error.message });
+        transition(sourceId, "transcribing", { progress: 42, extractionError: error.message });
+        extraction = await transcribeSource(mediaInput, outputDir, source.sourceId, [source.filename, source.name].filter(Boolean).join(". "));
+        fs.writeFileSync(subtitlePath(sourceId, "original.vtt"), extraction.content, "utf8");
+        parsedCues = removeEmptyCues(parseVtt(extraction.content));
+        transition(sourceId, "synchronizing", { progress: 50, origin: extraction.name, languageDeclared: extraction.lang });
+      }
+    }
     const cues = extraction.name === "faster-whisper" ? mergeShortCues(parsedCues) : parsedCues;
     if (!cues.length) throw new Error("Subtitle contains no valid cues");
     // OCR/text tracks can legitimately keep an on-screen sign for longer.
@@ -164,7 +197,10 @@ async function processJob(job) {
     let alignmentQuality = null;
     if (forcedAlignment?.words?.length) {
       const aligned = buildForcedAlignedCues(cues, texts, forcedAlignment.words);
-      translated = aligned.cues;
+      // Alignment chooses the spoken phrase boundaries. Finalization only
+      // subdivides visually dense phrases inside those ranges, preserving all
+      // translated text while enforcing readable two-line captions.
+      translated = finalizeCues(aligned.cues);
       alignmentQuality = {
         ...aligned.stats,
         audioStream: forcedAlignment.audioStream,
@@ -181,7 +217,7 @@ async function processJob(job) {
       fs.writeFileSync(subtitlePath(sourceId, "validation-debug.vtt"), vtt, "utf8");
       throw new Error(`Final VTT validation failed: expected ${translated.length} cues, parsed ${validatedCues.length}`);
     }
-    const finalQuality = assertCueIntegrity(validatedCues, { maxCueSeconds });
+    const finalQuality = assertCueIntegrity(validatedCues, { maxCueSeconds, maxLineChars: 42 });
     fs.writeFileSync(finalPath, vtt, "utf8");
     clearFailureMarker(sourceId);
     inc("translations_total");

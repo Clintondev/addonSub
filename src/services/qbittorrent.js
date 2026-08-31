@@ -78,10 +78,51 @@ async function startTorrent(hash) {
   await request("/torrents/setForceStart", { method: "POST", body: { hashes: hash, value: "true" } });
 }
 
+async function forceRecheck(hash, timeoutMs = 10 * 60 * 1000) {
+  await request("/torrents/recheck", { method: "POST", body: { hashes: String(hash).toLowerCase() } });
+  await delay(1000);
+  const deadline = Date.now() + timeoutMs;
+  let observedChecking = false;
+  while (Date.now() < deadline) {
+    const torrent = await getTorrent(String(hash).toLowerCase());
+    if (!torrent) throw new Error("Torrent desapareceu durante a verificação");
+    const checking = /^checking/i.test(String(torrent.state || ""));
+    observedChecking ||= checking;
+    if (!checking && (observedChecking || Number(torrent.progress) < 1)) return torrent;
+    await delay(2000);
+  }
+  throw new Error("Verificação do torrent excedeu o tempo limite");
+}
+
 function torrentStorageRoot(torrent, sourceId) {
   const savePath = String(torrent?.save_path || "").replace(/\\/g, "/");
   const relative = savePath.startsWith("/downloads/") ? savePath.slice("/downloads/".length) : sourceId;
   return safeChildPath(config.mediaDir, relative || sourceId);
+}
+
+function localDownloadPath(downloadPath) {
+  const normalized = String(downloadPath || "").replace(/\\/g, "/");
+  if (!normalized.startsWith("/downloads/")) return null;
+  const relative = normalized.slice("/downloads/".length);
+  return relative ? safeRelativePath(config.mediaDir, relative) : null;
+}
+
+function torrentFilePathCandidates(torrent, sourceId, fileName) {
+  const candidates = [];
+  const contentPath = localDownloadPath(torrent?.content_path);
+  if (contentPath) {
+    candidates.push(contentPath);
+    candidates.push(safeRelativePath(contentPath, fileName));
+  }
+  candidates.push(safeRelativePath(torrentStorageRoot(torrent, sourceId), fileName));
+  return [...new Set(candidates.map((candidate) => path.resolve(candidate)))];
+}
+
+function resolveTorrentFilePath(torrent, sourceId, fileName) {
+  return torrentFilePathCandidates(torrent, sourceId, fileName).find((candidate) => {
+    try { return fs.statSync(candidate).isFile(); }
+    catch (_) { return false; }
+  }) || null;
 }
 
 async function acquireTorrentUnlocked(source, onProgress = () => {}) {
@@ -124,9 +165,10 @@ async function acquireTorrentUnlocked(source, onProgress = () => {}) {
     if (current.progress > lastProgress) {
       lastProgress = current.progress;
       lastProgressAt = Date.now();
-    } else if (Date.now() - lastProgressAt >= config.torrentNoProgressTimeoutMs && torrent.num_seeds === 0 && Number(torrent.availability || 0) < 1) {
+    } else if (Date.now() - lastProgressAt >= config.torrentNoProgressTimeoutMs
+      && (Number(torrent.num_seeds || 0) === 0 || Number(torrent.availability || 0) < 1)) {
       await stopTorrent(hash);
-      throw new Error("Torrent sem progresso e sem seed disponível; escolha outra fonte");
+      throw new Error("Torrent sem progresso ou sem disponibilidade completa; tentando outra fonte");
     }
     await onProgress({
       stage: "acquiring",
@@ -139,9 +181,8 @@ async function acquireTorrentUnlocked(source, onProgress = () => {}) {
     });
     if (current.progress >= 1) {
       await stopTorrent(hash);
-      const sourceRoot = torrentStorageRoot(torrent, source.sourceId);
-      const localPath = safeRelativePath(sourceRoot, current.name);
-      if (!fs.existsSync(localPath)) throw new Error("Downloaded media file was not found in shared storage");
+      const localPath = resolveTorrentFilePath(torrent, source.sourceId, current.name);
+      if (!localPath) throw new Error("Downloaded media file was not found in shared storage");
       return { localPath, fileName: current.name, size: current.size, fileIdx: current.index };
     }
     await delay(3000);
@@ -168,4 +209,4 @@ async function acquireTorrent(source, onProgress = () => {}) {
   return withTorrentLock(hash, () => acquireTorrentUnlocked(source, onProgress));
 }
 
-module.exports = { request, getTorrent, getFiles, chooseFile, acquireTorrent, directorySize, isPausedState, torrentStorageRoot };
+module.exports = { request, getTorrent, getFiles, chooseFile, acquireTorrent, directorySize, forceRecheck, isPausedState, torrentStorageRoot, torrentFilePathCandidates, resolveTorrentFilePath };

@@ -57,6 +57,9 @@ module.exports = Object.freeze({
   torrentDownloadTimeoutMs: number("TORRENT_DOWNLOAD_TIMEOUT_MINUTES", 720, { min: 5, max: 10080 }) * 60 * 1000,
   torrentMetadataTimeoutMs: number("TORRENT_METADATA_TIMEOUT_SECONDS", 180, { min: 30, max: 900 }) * 1000,
   torrentNoProgressTimeoutMs: number("TORRENT_NO_PROGRESS_TIMEOUT_SECONDS", 180, { min: 30, max: 3600 }) * 1000,
+  mediaRecoveryMaxAttempts: number("MEDIA_RECOVERY_MAX_ATTEMPTS", 2, { min: 1, max: 5 }),
+  mediaRecoveryMaxSources: number("MEDIA_RECOVERY_MAX_SOURCES", 3, { min: 1, max: 10 }),
+  mediaRecoveryRecheckTimeoutMs: number("MEDIA_RECOVERY_RECHECK_MINUTES", 10, { min: 1, max: 120 }) * 60 * 1000,
   maxStorageBytes: number("MAX_STORAGE_GB", 100, { min: 1, max: 100000 }) * 1024 * 1024 * 1024,
   targetLocale: process.env.TARGET_LOCALE || "pt-BR",
   subtitleTokenSecret,
@@ -73,7 +76,7 @@ module.exports = Object.freeze({
   },
   prefetch: {
     enabled: /^(1|true|yes)$/i.test(process.env.SERIES_PREFETCH_ENABLED || "true"),
-    ahead: number("SERIES_PREFETCH_AHEAD", 4, { min: 1, max: 12 }),
+    ahead: number("SERIES_PREFETCH_AHEAD", 0, { min: 0, max: 12 }),
     priority: number("SERIES_PREFETCH_PRIORITY", 20, { min: 2, max: 100 }),
     cooldownMs: number("SERIES_PREFETCH_COOLDOWN_MINUTES", 5, { min: 1, max: 1440 }) * 60 * 1000,
     metadataCacheMs: number("SERIES_METADATA_CACHE_HOURS", 24, { min: 1, max: 720 }) * 60 * 60 * 1000,

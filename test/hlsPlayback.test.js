@@ -2,7 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const config = require("../src/config");
 const { buildFfmpegArgs, choosePlan } = require("../src/services/hlsPlayback");
-const { addHlsTimestampMap, buildHlsMasterPlaylist, buildHlsSubtitlePlaylist, streamViews } = require("../src/index");
+const { addHlsTimestampMap, buildHlsMasterPlaylist, buildHlsSubtitlePlaylist, externalSubtitleView, streamViews } = require("../src/index");
 
 function probe(videoCodec, audioCodec = "aac", channels = 2) {
   return {
@@ -62,6 +62,17 @@ test("advertises PT-BR as the default HLS subtitle track", () => {
   assert.match(master, /NAME="Português \(Brasil\)"/);
   assert.match(master, /DEFAULT=YES/);
   assert.match(master, /SUBTITLES="subs"/);
+});
+
+test("advertises WebVTT instead of ASS to Stremio external subtitle clients", () => {
+  const subtitle = externalSubtitleView(
+    { sourceId: "src_ready", addonName: "Torrentio" },
+    { status: "ready", url: "https://example.test/pt-BR.vtt", assUrl: "https://example.test/pt-BR.ass" },
+    { includeAddon: true },
+  );
+  assert.match(subtitle.id, /^pt-auto-vtt-v3-/);
+  assert.match(subtitle.name, /compatível/);
+  assert.match(subtitle.url, /\.vtt$/);
 });
 
 test("builds a complete WebVTT subtitle media playlist", () => {

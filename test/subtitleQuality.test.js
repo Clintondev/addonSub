@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { mapTargetLocale } = require("../src/services/translate");
-const { analyzeCueIntegrity, assertCueIntegrity, localizeBrazilianPortuguese, mergeShortCues, finalizeCues, displayChunks, preserveDialogueLayout } = require("../src/services/subtitleQuality");
+const { analyzeCueIntegrity, assertCueIntegrity, assertSubtitleCompleteness, localizeBrazilianPortuguese, mergeShortCues, finalizeCues, displayChunks, preserveDialogueLayout, removeEmptyCues } = require("../src/services/subtitleQuality");
 
 test("maps Brazilian Portuguese to LibreTranslate API code", () => {
   assert.equal(mapTargetLocale("pt-BR"), "pt-BR");
@@ -44,6 +44,15 @@ test("splits expanded translations into at most two lines of 42 characters", () 
   assert.equal(chunks.join(" ").replace(/\n/g, " "), text);
 });
 
+test("final cue validation rejects lines that are too long to read", () => {
+  const cue = { time: "00:00:01.000 --> 00:00:05.000", text: "Esta é uma linha deliberadamente longa demais para passar pela validação de leitura." };
+  assert.throws(() => assertCueIntegrity([cue], { maxLineChars: 42 }), /linhas acima de 42 caracteres/);
+  const finalized = finalizeCues([cue]);
+  const stats = assertCueIntegrity(finalized, { maxLineChars: 42 });
+  assert.equal(stats.overlongLines, 0);
+  assert.ok(stats.maxLineChars <= 42);
+});
+
 test("preserves one visual line for each speaker in translated dialogue", () => {
   const source = "-He's not going to take this well.\n-Can you blame him? He's your nephew.";
   const translated = "-Ele não vai levar isso bem. -Você pode culpá-lo? Ele é seu sobrinho.";
@@ -67,4 +76,17 @@ test("reports the largest silent interval for quality auditing", () => {
     { time: "00:00:12.000 --> 00:00:13.000", text: "Two." },
   ]);
   assert.equal(stats.maxGapSeconds, 10);
+});
+
+test("rejects a one-line subtitle for a full episode", () => {
+  const cues = [{ time: "00:00:04.000 --> 00:00:09.000", text: "This is a world of magic." }];
+  assert.throws(() => assertSubtitleCompleteness(cues, 1467), /incompleta: 1 falas/);
+});
+
+test("removes OCR frames that contain no readable text", () => {
+  const cues = [
+    { time: "00:00:01.000 --> 00:00:02.000", text: "  " },
+    { time: "00:00:03.000 --> 00:00:04.000", text: "Dialogue" },
+  ];
+  assert.deepEqual(removeEmptyCues(cues).map((cue) => cue.text), ["Dialogue"]);
 });
