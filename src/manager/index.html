@@ -6,6 +6,7 @@
   <meta name="theme-color" content="#0b0d0f">
   <title>PT-AUTO · Gerenciador</title>
   <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="library.css">
 </head>
 <body>
   <div class="noise"></div>
@@ -26,7 +27,7 @@
       <a class="brand" href="#overview"><span class="brand-mark small">PT</span><span><b>PT-AUTO</b><small>MEDIA DESK</small></span></a>
       <nav>
         <button class="nav-item active" data-view="overview">Visão geral</button>
-        <button class="nav-item" data-view="library">Assistindo</button>
+        <button class="nav-item" data-view="library">Biblioteca</button>
         <button class="nav-item" data-view="subtitles">Legendas</button>
         <button class="nav-item" data-view="logs">Erros e logs <span id="error-badge" class="badge">0</span></button>
       </nav>
@@ -53,7 +54,18 @@
       </section>
 
       <section id="library-view" class="view">
-        <div class="toolbar"><div class="segmented"><button class="active" data-filter="all">Todos</button><button data-filter="watching">Assistindo</button><button data-filter="paused">Pausados</button><button data-filter="completed">Concluídos</button></div><input id="search" class="search" placeholder="Buscar série, filme ou episódio"></div>
+        <div class="library-tools">
+          <div><p class="eyebrow">ORGANIZAÇÃO</p><h3>Filmes e séries</h3><p class="muted">Abra um título, escolha a temporada e selecione os itens que deseja preparar ou apagar.</p></div>
+          <div class="tool-filters">
+            <div class="segmented" aria-label="Tipo de conteúdo"><button class="active" data-library-kind="all">Tudo</button><button data-library-kind="series">Séries</button><button data-library-kind="movie">Filmes</button></div>
+            <div class="segmented" aria-label="Estado da biblioteca"><button class="active" data-filter="all">Todos</button><button data-filter="watching">Assistindo</button><button data-filter="paused">Pausados</button><button data-filter="completed">Concluídos</button></div>
+            <input id="search" class="search" placeholder="Buscar título ou episódio">
+          </div>
+        </div>
+        <div id="batch-bar" class="batch-bar" hidden>
+          <div><b id="batch-count">0 selecionados</b><small id="batch-detail">Escolha uma ação para os itens.</small></div>
+          <div class="batch-actions"><button id="clear-selection" class="secondary">Limpar</button><button id="delete-selected" class="secondary dangerous-action">Apagar selecionados</button><button id="prepare-selected" class="primary compact">Preparar selecionados</button></div>
+        </div>
         <div id="library" class="library"></div>
       </section>
 

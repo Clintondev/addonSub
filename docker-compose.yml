@@ -5,9 +5,12 @@ services:
     env_file: [.env]
     environment:
       NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
-    ports: ["7000:7000"]
+      STORAGE_DIR: /usr/src/app/storage
+    # A porta direta fica disponível somente neste computador. O acesso remoto
+    # passa pelo túnel, onde CF-Connecting-IP identifica o cliente original.
+    ports: ["127.0.0.1:7000:7000"]
     volumes:
-      - ./storage:/usr/src/app/storage
+      - ${STORAGE_HOST_PATH:-./storage}:/usr/src/app/storage
     deploy:
       resources:
         reservations:
@@ -35,8 +38,10 @@ services:
     restart: unless-stopped
     env_file: [.env]
     command: ["npm", "run", "worker"]
+    environment:
+      STORAGE_DIR: /usr/src/app/storage
     volumes:
-      - ./storage:/usr/src/app/storage
+      - ${STORAGE_HOST_PATH:-./storage}:/usr/src/app/storage
     depends_on:
       redis: { condition: service_healthy }
       intelligence: { condition: service_healthy }
@@ -48,7 +53,7 @@ services:
     build: ./torrent
     restart: unless-stopped
     volumes:
-      - ./storage/media:/downloads
+      - ${STORAGE_HOST_PATH:-./storage}/media:/downloads
       - qbittorrent-config:/config
     ports:
       - "6881:6881/tcp"
@@ -81,7 +86,7 @@ services:
               device_ids: ["0"]
               capabilities: [gpu]
     volumes:
-      - ./storage:/usr/src/app/storage
+      - ${STORAGE_HOST_PATH:-./storage}:/usr/src/app/storage
       - whisper-models:/root/.cache/huggingface
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]

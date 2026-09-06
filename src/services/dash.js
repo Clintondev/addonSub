@@ -1,7 +1,7 @@
-const fetch = require("node-fetch");
 const { XMLParser } = require("fast-xml-parser");
 const logger = require("../logger");
 const { sanitizeUrl } = require("../utils/security");
+const { safeRemoteFetch, safeRemoteText } = require("./safeRemoteFetch");
 
 function resolveUrl(base, ref) {
   try {
@@ -12,9 +12,8 @@ function resolveUrl(base, ref) {
 }
 
 async function fetchText(url) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Falha ao baixar MPD ${sanitizeUrl(url)} (${res.status})`);
-  return res.text();
+  try { return (await safeRemoteText(url)).text; }
+  catch (error) { throw new Error(`Falha ao baixar MPD ${sanitizeUrl(url)}: ${error.message}`); }
 }
 
 function listSubtitleReps(manifest, baseUrl) {
@@ -85,7 +84,7 @@ async function extractDashSubtitle(mpdUrl, options = {}) {
     mime: track.mime,
     target: sanitizeUrl(mpdUrl),
   });
-  const res = await fetch(track.url);
+  const { response: res } = await safeRemoteFetch(track.url);
   if (!res.ok) throw new Error(`Falha ao baixar legenda DASH ${sanitizeUrl(track.url)}`);
   const content = await res.text();
   return {

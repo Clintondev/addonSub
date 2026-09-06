@@ -1,5 +1,10 @@
 # Gateway de mídia e legendas contextuais para Stremio
 
+> **Documento histórico de concepção.** Parte das seções abaixo descreve a
+> arquitetura originalmente proposta e problemas do esqueleto inicial que já
+> foram resolvidos. Para instalação e comportamento operacional atual, consulte
+> o `README.md` e o código-fonte.
+
 ## 1. Visão do projeto
 
 Este projeto tem como objetivo construir um add-on intermediário para o Stremio capaz de agregar streams oferecidos por outros add-ons, identificar exatamente qual fonte foi escolhida pelo usuário e preparar uma versão consumível com legenda em português brasileiro.

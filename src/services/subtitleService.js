@@ -5,6 +5,8 @@ const { enqueueSubtitleJob } = require("../jobs/queue");
 const { signPath, safeChildPath } = require("../utils/security");
 const { inc } = require("../metrics");
 const { repairSubtitleLayout } = require("./subtitleLayout");
+const { parseVtt } = require("./vtt");
+const { clearCancellation } = require("./cancellationStore");
 
 function sourceDir(sourceId) {
   return safeChildPath(config.storageDir, "subtitles", sourceId);
@@ -23,16 +25,39 @@ function subtitleUrl(sourceId, fileName) {
   return `${config.baseUrl}/assets/subtitles/${encodeURIComponent(sourceId)}/${encodeURIComponent(fileName)}?token=${token}`;
 }
 
+function vttToSrt(vtt) {
+  return `${parseVtt(String(vtt)).map((cue, index) => {
+    const timing = String(cue.time)
+      .replace(/^(\d+:\d{2}:\d{2})\.(\d{3})(\s+-->\s+)(\d+:\d{2}:\d{2})\.(\d{3}).*$/, "$1,$2$3$4,$5");
+    return `${index + 1}\n${timing}\n${cue.text}`;
+  }).join("\n\n")}\n`;
+}
+
+function ensureSrtSubtitle(sourceId, translated) {
+  const target = subtitlePath(sourceId, "pt-BR.srt");
+  const sourceStat = fs.statSync(translated);
+  if (fs.existsSync(target) && fs.statSync(target).mtimeMs >= sourceStat.mtimeMs) return target;
+  const temporary = `${target}.${process.pid}.tmp`;
+  fs.writeFileSync(temporary, vttToSrt(fs.readFileSync(translated, "utf8")), "utf8");
+  fs.renameSync(temporary, target);
+  return target;
+}
+
 function translationStatus(sourceId) {
   const translated = subtitlePath(sourceId, "pt-BR.vtt");
   if (fs.existsSync(translated)) {
     try { repairSubtitleLayout(sourceId); } catch (error) { logger.warn("Falha ao preservar layout da legenda", { sourceId, error: error.message }); }
+    let srt = null;
+    try { srt = ensureSrtSubtitle(sourceId, translated); }
+    catch (error) { logger.warn("Falha ao gerar fallback SRT", { sourceId, error: error.message }); }
     inc("cache_hits");
     const ass = subtitlePath(sourceId, "pt-BR.ass");
     return {
       status: "ready",
       path: translated,
       url: subtitleUrl(sourceId, "pt-BR.vtt"),
+      srtPath: srt,
+      srtUrl: srt ? subtitleUrl(sourceId, "pt-BR.srt") : null,
       assPath: fs.existsSync(ass) ? ass : null,
       assUrl: fs.existsSync(ass) ? subtitleUrl(sourceId, "pt-BR.ass") : null,
     };
@@ -42,8 +67,12 @@ function translationStatus(sourceId) {
 }
 
 async function queueTranslationJob(sourceId, priority = 5) {
+  // Source ids are deterministic. Deleting an episode and selecting the same
+  // release later therefore reuses the id; the old tombstone must not cancel
+  // the newly requested job.
+  clearCancellation(sourceId);
   ensureSourceDir(sourceId);
-  return enqueueSubtitleJob({ sourceId }, priority);
+  return enqueueSubtitleJob({ sourceId, requestedAt: Date.now() }, priority);
 }
 
 async function savePendingSubtitle(sourceId) {
@@ -56,4 +85,4 @@ async function savePendingSubtitle(sourceId) {
   return file;
 }
 
-module.exports = { ensureSourceDir, translationStatus, queueTranslationJob, savePendingSubtitle, subtitleUrl, subtitlePath };
+module.exports = { ensureSourceDir, ensureSrtSubtitle, translationStatus, queueTranslationJob, savePendingSubtitle, subtitleUrl, subtitlePath, vttToSrt };

@@ -22,6 +22,7 @@ function httpUrl(name, fallback) {
 
 const storageDir = path.resolve(process.env.STORAGE_DIR || path.join(process.cwd(), "storage"));
 const hlsDir = path.join(storageDir, "hls");
+const playbackDir = path.join(storageDir, "playback");
 const upstreamAddons = list("UPSTREAM_ADDONS").map((entry, index) => {
   const separator = entry.indexOf("|");
   const name = separator === -1 ? `upstream-${index + 1}` : entry.slice(0, separator).trim();
@@ -53,6 +54,7 @@ module.exports = Object.freeze({
   qbittorrentUrl: httpUrl("QBITTORRENT_URL", "http://qbittorrent:8080"),
   storageDir,
   hlsDir,
+  playbackDir,
   mediaDir: path.join(storageDir, "media"),
   torrentDownloadTimeoutMs: number("TORRENT_DOWNLOAD_TIMEOUT_MINUTES", 720, { min: 5, max: 10080 }) * 60 * 1000,
   torrentMetadataTimeoutMs: number("TORRENT_METADATA_TIMEOUT_SECONDS", 180, { min: 30, max: 900 }) * 1000,
@@ -67,12 +69,19 @@ module.exports = Object.freeze({
   upstreamAddons,
   upstreamTimeoutMs: number("UPSTREAM_TIMEOUT_MS", 12000, { min: 500, max: 60000 }),
   signedUrlTtlSeconds: number("SIGNED_URL_TTL_SECONDS", 86400, { min: 60, max: 604800 }),
+  allowedClientIps: list("ALLOWED_CLIENT_IPS"),
+  remoteFetchTimeoutMs: number("REMOTE_FETCH_TIMEOUT_SECONDS", 20, { min: 2, max: 120 }) * 1000,
+  remoteFetchMaxBytes: number("REMOTE_FETCH_MAX_MB", 16, { min: 1, max: 256 }) * 1024 * 1024,
   preferredSubtitleLangs: list("PREFERRED_SUB_LANGS", "pob,pt-br,pb,por,pt,eng,en,spa,fra,ita").map((s) => s.toLowerCase()),
   translateBatchChars: number("TRANSLATE_BATCH_CHARS", 3500, { min: 250, max: 20000 }),
   job: {
     concurrency: number("JOB_CONCURRENCY", 2, { min: 1, max: 16 }),
     rateLimit: number("JOB_RATE_LIMIT", 4, { min: 1, max: 100 }),
     lockDurationMs: number("JOB_LOCK_DURATION_MS", 3600000, { min: 30000, max: 3600000 }),
+  },
+  gpu: {
+    lockWaitMs: number("GPU_LOCK_WAIT_SECONDS", 1800, { min: 1, max: 7200 }) * 1000,
+    lockLeaseMs: number("GPU_LOCK_LEASE_SECONDS", 120, { min: 30, max: 600 }) * 1000,
   },
   prefetch: {
     enabled: /^(1|true|yes)$/i.test(process.env.SERIES_PREFETCH_ENABLED || "true"),

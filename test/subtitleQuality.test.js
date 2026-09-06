@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { mapTargetLocale } = require("../src/services/translate");
-const { analyzeCueIntegrity, assertCueIntegrity, assertSubtitleCompleteness, localizeBrazilianPortuguese, mergeShortCues, finalizeCues, displayChunks, preserveDialogueLayout, removeEmptyCues } = require("../src/services/subtitleQuality");
+const { analyzeCueIntegrity, assertCueIntegrity, assertSubtitleCompleteness, localizeBrazilianPortuguese, mergeShortCues, finalizeCues, displayChunks, normalizeDialogueMarkers, preserveDialogueLayout, removeEmptyCues } = require("../src/services/subtitleQuality");
 
 test("maps Brazilian Portuguese to LibreTranslate API code", () => {
   assert.equal(mapTargetLocale("pt-BR"), "pt-BR");
@@ -59,6 +59,12 @@ test("preserves one visual line for each speaker in translated dialogue", () => 
   const preserved = preserveDialogueLayout(source, translated);
   assert.equal(preserved, "- Ele não vai levar isso bem.\n- Você pode culpá-lo? Ele é seu sobrinho.");
   assert.deepEqual(displayChunks(preserved), [preserved]);
+});
+
+test("normalizes duplicated dialogue markers before wrapping", () => {
+  const normalized = normalizeDialogueMarkers("- -Existe uma expressão para isso... Hum...");
+  assert.equal(normalized, "- Existe uma expressão para isso... Hum...");
+  assert.equal(displayChunks(normalized).flatMap((chunk) => chunk.split("\n")).every((line) => line.length <= 42), true);
 });
 
 test("rejects a subtitle containing a silently stretched transcription cue", () => {

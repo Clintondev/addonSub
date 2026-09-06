@@ -35,12 +35,16 @@ def timestamp(seconds: float) -> str:
     return f"{hours:02}:{minutes:02}:{secs:02}.{millis:03}"
 
 
-def get_model():
+def get_model_unlocked():
     global model
-    with model_lock:
-        if model is None:
-            model = WhisperModel(os.environ.get("WHISPER_MODEL", "small"), device=os.environ.get("WHISPER_DEVICE", "cpu"), compute_type=os.environ.get("WHISPER_COMPUTE_TYPE", "int8"))
+    if model is None:
+        model = WhisperModel(os.environ.get("WHISPER_MODEL", "small"), device=os.environ.get("WHISPER_DEVICE", "cpu"), compute_type=os.environ.get("WHISPER_COMPUTE_TYPE", "int8"))
     return model
+
+
+def get_model():
+    with model_lock:
+        return get_model_unlocked()
 
 
 def storage_file(value: str, field: str) -> Path:
@@ -91,17 +95,21 @@ def unload():
 @app.post("/transcribe")
 def transcribe(request: TranscriptionRequest):
     audio = storage_file(request.audioPath, "audioPath")
-    segments, info = get_model().transcribe(
-        str(audio),
-        **transcription_options(),
-        initial_prompt=request.prompt.strip() or None,
-    )
-    lines = ["WEBVTT", ""]
-    count = 0
-    for count, segment in enumerate(segments, 1):
-        text = segment.text.strip()
-        if text:
-            lines.extend([str(count), f"{timestamp(segment.start)} --> {timestamp(segment.end)}", text, ""])
+    # faster-whisper yields segments lazily. Keep the lock until the generator
+    # is fully consumed so /unload and another transcription cannot race it.
+    with model_lock:
+        segments, info = get_model_unlocked().transcribe(
+            str(audio),
+            **transcription_options(),
+            initial_prompt=request.prompt.strip() or None,
+        )
+        lines = ["WEBVTT", ""]
+        count = 0
+        for segment in segments:
+            text = segment.text.strip()
+            if text:
+                count += 1
+                lines.extend([str(count), f"{timestamp(segment.start)} --> {timestamp(segment.end)}", text, ""])
     if count == 0:
         raise HTTPException(status_code=422, detail="no speech detected")
     return {"language": info.language or "und", "vtt": "\n".join(lines)}
@@ -111,23 +119,24 @@ def transcribe(request: TranscriptionRequest):
 def word_timestamps(request: AlignmentRequest):
     """Return audio-derived word boundaries for forced subtitle alignment."""
     media = storage_file(request.mediaPath, "mediaPath")
-    segments, info = get_model().transcribe(
-        str(media),
-        **transcription_options(),
-        language=request.language.strip() or None,
-        initial_prompt=request.prompt.strip() or None,
-    )
-    words = []
-    for segment in segments:
-        for word in segment.words or []:
-            text = (word.word or "").strip()
-            if text and word.start is not None and word.end is not None and word.end > word.start:
-                words.append({
-                    "text": text,
-                    "start": round(float(word.start), 3),
-                    "end": round(float(word.end), 3),
-                    "probability": round(float(word.probability or 0), 4),
-                })
+    with model_lock:
+        segments, info = get_model_unlocked().transcribe(
+            str(media),
+            **transcription_options(),
+            language=request.language.strip() or None,
+            initial_prompt=request.prompt.strip() or None,
+        )
+        words = []
+        for segment in segments:
+            for word in segment.words or []:
+                text = (word.word or "").strip()
+                if text and word.start is not None and word.end is not None and word.end > word.start:
+                    words.append({
+                        "text": text,
+                        "start": round(float(word.start), 3),
+                        "end": round(float(word.end), 3),
+                        "probability": round(float(word.probability or 0), 4),
+                    })
     if not words:
         raise HTTPException(status_code=422, detail="no timestamped words detected")
     return {"language": info.language or request.language or "und", "words": words}

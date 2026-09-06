@@ -155,7 +155,7 @@ async function translateGemmaChunk(chunk, { endpoint, model, sourceLang, targetL
     if (/\bfor you\b/i.test(item.text)) semanticConstraints.push(`${item.id}: preserve the agent and the beneficiary "for you" explicitly as por você/pra você; do not replace it with merely helping you.`);
   });
   const prompt = [
-    `You are a professional ${sourceName} (${sourceLang || "en"}) to Brazilian Portuguese (${mapTargetLocale(targetLocale)}) translator. Your goal is to accurately convey the meaning and nuances of the original ${sourceName} subtitle dialogue while adhering to Brazilian Portuguese grammar, vocabulary, natural speech, slang, and cultural sensitivities. Preserve the exact grammatical person, subject, agent, tense, modality, and negation: never turn a first-person statement into a command or change who performs an action. Use surrounding lines to resolve omitted pronouns and keep repeated concepts consistent throughout the scene. Preserve the register, humor, insults, and profanity. Never censor, soften, euphemize, or put offensive language in quotation marks. Translate idioms by meaning instead of word-for-word. Translate only the text inside each <sub> element. Preserve every XML tag and id exactly. Produce only the translated XML, without explanations or commentary. Please translate the following ${sourceName} subtitle dialogue into Brazilian Portuguese:`,
+    `You are a professional ${sourceName} (${sourceLang || "en"}) to Brazilian Portuguese (${mapTargetLocale(targetLocale)}) translator. Your goal is to accurately convey the meaning and nuances of the original ${sourceName} subtitle dialogue while adhering to Brazilian Portuguese grammar, vocabulary, natural speech, slang, and cultural sensitivities. Preserve the exact grammatical person, subject, agent, tense, modality, and negation: never turn a first-person statement into a command or change who performs an action. Use surrounding lines to resolve omitted pronouns and keep repeated concepts consistent throughout the scene. Preserve the register, humor, insults, and profanity. Never censor, soften, euphemize, or put offensive language in quotation marks. Translate idioms by meaning instead of word-for-word. Translate only the text inside each <sub> element. Preserve every XML tag and id exactly. Return exactly one non-empty <sub> element for every input id, in the same order. Subtitle cues may split one sentence across multiple ids: never merge, omit, renumber, or shift those fragments; translate each fragment under its own original id. Produce only the translated XML, without explanations or commentary. Please translate the following ${sourceName} subtitle dialogue into Brazilian Portuguese:`,
     semanticConstraints.length ? `Mandatory semantic constraints:\n${semanticConstraints.join("\n")}` : "",
     "",
     taggedText,
@@ -196,6 +196,45 @@ async function translateGemmaChunk(chunk, { endpoint, model, sourceLang, targetL
   throw lastError || new Error("Falha no TranslateGemma");
 }
 
+function resilientSplitIndex(chunk) {
+  if (chunk.length < 2) return 0;
+  const middle = Math.floor(chunk.length / 2);
+  // Prefer a pause or sentence boundary close to the middle so fragments of
+  // the same sentence retain as much shared context as possible.
+  const candidates = [];
+  for (let index = 1; index < chunk.length; index++) {
+    const previous = chunk[index - 1];
+    const current = chunk[index];
+    const gap = Number.isFinite(previous.endMs) && Number.isFinite(current.startMs)
+      ? current.startMs - previous.endMs : 0;
+    const sentenceEnd = /[.!?]["')\]]?\s*$/.test(previous.text);
+    if (gap >= 1200 || sentenceEnd) candidates.push({ index, distance: Math.abs(index - middle), gap });
+  }
+  candidates.sort((left, right) => left.distance - right.distance || right.gap - left.gap);
+  return candidates[0]?.index || middle;
+}
+
+async function translateGemmaChunkResilient(chunk, options, depth = 0) {
+  try {
+    // The full block gets the configured retries. Recovery blocks get one
+    // deterministic attempt each before being divided again.
+    return await translateGemmaChunk(chunk, { ...options, retries: depth === 0 ? options.retries : 0 });
+  } catch (error) {
+    if (chunk.length <= 1) throw error;
+    const split = resilientSplitIndex(chunk);
+    logger.warn("Retrying rejected TranslateGemma block in smaller verified parts", {
+      cues: chunk.length,
+      leftCues: split,
+      rightCues: chunk.length - split,
+      depth,
+      error: error.message,
+    });
+    const left = await translateGemmaChunkResilient(chunk.slice(0, split), options, depth + 1);
+    const right = await translateGemmaChunkResilient(chunk.slice(split), options, depth + 1);
+    return [...left, ...right];
+  }
+}
+
 async function requestStructuredTranslations({ endpoint, model, system, user, count, timeoutMs }) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -225,7 +264,7 @@ async function requestStructuredTranslations({ endpoint, model, system, user, co
 
 async function translateContextualChunk(chunk, { endpoint, model, sourceLang, targetLocale, contextTitle, timeoutMs = 300000, retries = 2 }) {
   if (/^translategemma(?::|$)/i.test(model)) {
-    return translateGemmaChunk(chunk, { endpoint, model, sourceLang, targetLocale, contextTitle, timeoutMs, retries });
+    return translateGemmaChunkResilient(chunk, { endpoint, model, sourceLang, targetLocale, contextTitle, timeoutMs, retries });
   }
   const system = [
     "Você é um tradutor profissional brasileiro especializado em legendagem de filmes e séries.",
@@ -294,6 +333,7 @@ module.exports = {
   translateContextual,
   translateContextualChunk,
   translateGemmaChunk,
+  translateGemmaChunkResilient,
   normalizeSourceForTranslation,
   translateText,
   unloadContextualModel,

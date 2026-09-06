@@ -55,6 +55,14 @@ function plainText(text) {
   return String(text || "").replace(/\s*\n\s*/g, " ").replace(/\s+/g, " ").trim();
 }
 
+function normalizeDialogueMarkers(text) {
+  return String(text || "")
+    .split("\n")
+    .map((line) => line.replace(/^\s*[-–—]\s*[-–—]+\s*/u, "- ").replace(/^\s*([-–—])(?=\S)/u, "$1 ").trimEnd())
+    .join("\n")
+    .trim();
+}
+
 function dialogueTurns(text) {
   const value = String(text || "").trim();
   const normalizeTurn = (line) => line.replace(/\s+/g, " ").trim();
@@ -66,9 +74,10 @@ function dialogueTurns(text) {
 
 function preserveDialogueLayout(sourceText, translatedText) {
   const sourceTurns = dialogueTurns(sourceText);
-  if (sourceTurns.length < 2) return translatedText;
-  const translatedTurns = dialogueTurns(translatedText);
-  if (translatedTurns.length !== sourceTurns.length) return translatedText;
+  const normalized = normalizeDialogueMarkers(translatedText);
+  if (sourceTurns.length < 2) return normalized;
+  const translatedTurns = dialogueTurns(normalized);
+  if (translatedTurns.length !== sourceTurns.length) return normalized;
   return translatedTurns.map((line) => `- ${line}`).join("\n");
 }
 
@@ -94,7 +103,8 @@ function mergeShortCues(cues, { maxChars = 105, maxGapSeconds = 0.65, minDuratio
 }
 
 function displayChunks(text, maxLineChars = 42, maxLines = 2) {
-  const turns = dialogueTurns(text);
+  const normalized = normalizeDialogueMarkers(text);
+  const turns = dialogueTurns(normalized);
   const wrapLines = (value) => {
     const words = plainText(value).split(" ").filter(Boolean);
     if (!words.length) return [""];
@@ -113,7 +123,7 @@ function displayChunks(text, maxLineChars = 42, maxLines = 2) {
   };
   const lines = turns.length > 1
     ? turns.flatMap((turn) => wrapLines(`- ${turn}`))
-    : wrapLines(text);
+    : wrapLines(normalized);
   const chunks = [];
   for (let index = 0; index < lines.length; index += maxLines) chunks.push(lines.slice(index, index + maxLines).join("\n"));
   return chunks;
@@ -212,6 +222,7 @@ module.exports = {
   formatTimestamp,
   localizeBrazilianPortuguese,
   mergeShortCues,
+  normalizeDialogueMarkers,
   parseTimestamp,
   dialogueTurns,
   preserveDialogueLayout,

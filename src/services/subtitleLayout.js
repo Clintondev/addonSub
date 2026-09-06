@@ -3,11 +3,11 @@ const path = require("path");
 const config = require("../config");
 const { parseVtt, serializeVtt } = require("./vtt");
 const { applyPgsPositions, parsePgsPositions, withPositionSettings } = require("./pgs");
-const { parseTimestamp, preserveDialogueLayout } = require("./subtitleQuality");
+const { finalizeCues, normalizeDialogueMarkers, parseTimestamp, preserveDialogueLayout } = require("./subtitleQuality");
 const { safeChildPath } = require("../utils/security");
 const { vttCuesToAss } = require("./ass");
 
-const LAYOUT_VERSION = 2;
+const LAYOUT_VERSION = 3;
 
 function writeAss(dir, cues) {
   const assPath = path.join(dir, "pt-BR.ass");
@@ -40,9 +40,16 @@ function repairSubtitleLayout(sourceId, { backup = false, force = false } = {}) 
   const meta = JSON.parse(fs.readFileSync(statePath, "utf8"));
   const track = /ocr-pgs-track-(\d+)/.exec(String(meta.origin || ""));
   if (!track) {
-    const finalCues = parseVtt(fs.readFileSync(finalPath, "utf8"));
+    const current = fs.readFileSync(finalPath, "utf8");
+    const finalCues = finalizeCues(parseVtt(current).map((cue) => ({ ...cue, text: normalizeDialogueMarkers(cue.text) })));
+    const serialized = serializeVtt(finalCues);
+    if (serialized !== current) {
+      const temporary = `${finalPath}.layout.tmp`;
+      fs.writeFileSync(temporary, serialized, "utf8");
+      fs.renameSync(temporary, finalPath);
+    }
     writeAss(dir, finalCues);
-    const result = { version: LAYOUT_VERSION, sourceId, cues: finalCues.length, positioned: 0, dialogues: 0, finalMtimeMs: finalMtime, completedAt: new Date().toISOString() };
+    const result = { version: LAYOUT_VERSION, sourceId, cues: finalCues.length, positioned: 0, dialogues: 0, finalMtimeMs: fs.statSync(finalPath).mtimeMs, completedAt: new Date().toISOString() };
     fs.writeFileSync(markerPath, JSON.stringify(result, null, 2), "utf8");
     return result;
   }
@@ -69,6 +76,7 @@ function repairSubtitleLayout(sourceId, { backup = false, force = false } = {}) 
     if (sourceTime.settings) { time = withPositionSettings(time, sourceTime.settings); positioned++; }
     return { ...cue, time, text };
   });
+  const formatted = finalizeCues(repaired.map((cue) => ({ ...cue, text: normalizeDialogueMarkers(cue.text) })));
   if (backup) {
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     fs.copyFileSync(finalPath, path.join(dir, `pt-BR-before-layout-${stamp}.vtt`));
@@ -76,11 +84,11 @@ function repairSubtitleLayout(sourceId, { backup = false, force = false } = {}) 
   const originalTemporary = `${originalPath}.layout.tmp`;
   const finalTemporary = `${finalPath}.layout.tmp`;
   fs.writeFileSync(originalTemporary, serializeVtt(sourceCues), "utf8");
-  fs.writeFileSync(finalTemporary, serializeVtt(repaired), "utf8");
+  fs.writeFileSync(finalTemporary, serializeVtt(formatted), "utf8");
   fs.renameSync(originalTemporary, originalPath);
   fs.renameSync(finalTemporary, finalPath);
-  writeAss(dir, repaired);
-  const result = { version: LAYOUT_VERSION, sourceId, cues: repaired.length, positioned, dialogues, finalMtimeMs: fs.statSync(finalPath).mtimeMs, completedAt: new Date().toISOString() };
+  writeAss(dir, formatted);
+  const result = { version: LAYOUT_VERSION, sourceId, cues: formatted.length, positioned, dialogues, finalMtimeMs: fs.statSync(finalPath).mtimeMs, completedAt: new Date().toISOString() };
   fs.writeFileSync(markerPath, JSON.stringify(result, null, 2), "utf8");
   return result;
 }

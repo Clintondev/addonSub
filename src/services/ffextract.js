@@ -40,7 +40,21 @@ function pickPgsTrack(tracks, preferredLangs) {
     if (/songs?|signs?|forced/.test(title)) return 2;
     return 1;
   }
-  return [...pgs].sort((a, b) => languageRank(a, preferredLangs) - languageRank(b, preferredLangs) || kindRank(a) - kindRank(b) || Number(a.forced) - Number(b.forced))[0] || null;
+  return [...pgs].sort((a, b) => kindRank(a) - kindRank(b) || Number(a.forced) - Number(b.forced) || languageRank(a, preferredLangs) - languageRank(b, preferredLangs))[0] || null;
+}
+
+function rankedTracks(tracks, preferredLangs) {
+  const textCodecs = new Set(["subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text", "ttml"]);
+  const text = tracks.filter((track) => textCodecs.has(String(track.codec || "").toLowerCase()))
+    .sort((a, b) => Number(a.forced) - Number(b.forced) || languageRank(a, preferredLangs) - languageRank(b, preferredLangs));
+  const pgs = tracks.filter((track) => String(track.codec || "").toLowerCase() === "hdmv_pgs_subtitle");
+  const rankedPgs = [];
+  while (pgs.length) {
+    const selected = pickPgsTrack(pgs, preferredLangs);
+    rankedPgs.push(selected);
+    pgs.splice(pgs.indexOf(selected), 1);
+  }
+  return [...text, ...rankedPgs];
 }
 
 function extractTrackToVtt(sourceUrl, trackIndex, outputPath) {
@@ -87,19 +101,28 @@ function extractPgsToVtt(sourceUrl, trackIndex, outputDir) {
   return applyPgsPositionsToVtt(vtt, supPath);
 }
 
-async function extractFileSubtitle(sourceUrl, outputDir, preferredLangs) {
+async function extractFileSubtitle(sourceUrl, outputDir, preferredLangs, { excludedTrackIndexes = [] } = {}) {
   logger.info("Extraindo legenda embutida", { source: sanitizeUrl(sourceUrl) });
   const tracks = probeSubtitles(sourceUrl);
   if (!tracks.length) throw new Error("Nenhuma trilha de legenda no arquivo");
-  const textTrack = pickTextTrack(tracks, preferredLangs);
-  if (textTrack) {
-    const content = extractTrackToVtt(sourceUrl, textTrack.ffIndex, path.join(outputDir, `track-${textTrack.ffIndex}.vtt`));
-    return { lang: textTrack.lang || "und", name: `track-${textTrack.ffIndex}`, content };
+  const excluded = new Set(excludedTrackIndexes.map(Number));
+  const candidates = rankedTracks(tracks, preferredLangs).filter((track) => !excluded.has(Number(track.ffIndex)));
+  if (!candidates.length) throw new Error("Nenhuma trilha de legenda textual ou PGS utilizável no arquivo");
+  const errors = [];
+  for (const track of candidates) {
+    try {
+      const pgs = String(track.codec || "").toLowerCase() === "hdmv_pgs_subtitle";
+      if (pgs) logger.info("Convertendo legenda PGS embutida com OCR", { trackIndex: track.ffIndex, language: track.lang, title: track.title });
+      const content = pgs
+        ? extractPgsToVtt(sourceUrl, track.ffIndex, outputDir)
+        : extractTrackToVtt(sourceUrl, track.ffIndex, path.join(outputDir, `track-${track.ffIndex}.vtt`));
+      return { lang: track.lang || "und", name: pgs ? `ocr-pgs-track-${track.ffIndex}` : `track-${track.ffIndex}`, trackIndex: track.ffIndex, content };
+    } catch (error) {
+      errors.push(`track ${track.ffIndex}: ${error.message}`);
+      logger.warn("Falha ao extrair trilha; tentando a próxima", { trackIndex: track.ffIndex, error: error.message });
+    }
   }
-  const pgsTrack = pickPgsTrack(tracks, preferredLangs);
-  if (!pgsTrack) throw new Error("Nenhuma trilha de legenda textual ou PGS utilizável no arquivo");
-  logger.info("Convertendo legenda PGS embutida com OCR", { trackIndex: pgsTrack.ffIndex, language: pgsTrack.lang, title: pgsTrack.title });
-  return { lang: pgsTrack.lang || "und", name: `ocr-pgs-track-${pgsTrack.ffIndex}`, content: extractPgsToVtt(sourceUrl, pgsTrack.ffIndex, outputDir) };
+  throw new Error(`Nenhuma trilha embutida pôde ser extraída: ${errors.join(" | ")}`);
 }
 
-module.exports = { probeSubtitles, pickTextTrack, pickPgsTrack, srtToVtt, extractFileSubtitle };
+module.exports = { probeSubtitles, pickTextTrack, pickPgsTrack, rankedTracks, srtToVtt, extractFileSubtitle };

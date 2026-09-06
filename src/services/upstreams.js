@@ -5,6 +5,13 @@ const logger = require("../logger");
 const sourceStore = require("./sourceStore");
 const { parseVideoId } = require("./videoId");
 const { createSourceId, dedupeKey } = require("./sourceIdentity");
+const { subtitleOwner, hasReadySubtitle } = require("./subtitleAssociation");
+
+function readinessScore(item) {
+  const subtitleReady = hasReadySubtitle(subtitleOwner(item.record));
+  const mediaReady = Boolean(item.record.localPath && fs.existsSync(item.record.localPath));
+  return Number(subtitleReady) * 4 + Number(mediaReady) * 2;
+}
 
 function streamEndpoint(addonUrl, type, videoId) {
   const base = addonUrl.replace(/\/manifest\.json$/i, "").replace(/\/$/, "");
@@ -28,7 +35,9 @@ async function fetchStreams(addon, type, videoId) {
 }
 
 function normalizeStream(stream, addon, type, videoId) {
-  if (!stream || typeof stream !== "object" || (!stream.url && !stream.infoHash && !stream.externalUrl && !stream.ytId)) return null;
+  // externalUrl/ytId bypass the gateway, so the selected source could never
+  // receive a prepared PT-AUTO subtitle. Only resolvable media is advertised.
+  if (!stream || typeof stream !== "object" || (!stream.url && !stream.infoHash)) return null;
   const sourceId = createSourceId(stream, addon.id, videoId);
   const record = sourceStore.upsert({
     sourceId,
@@ -76,7 +85,10 @@ async function aggregateStreams(type, videoId) {
       if (normalized && !unique.has(normalized.key)) unique.set(normalized.key, normalized);
     }
   });
-  return [...unique.values()];
+  return [...unique.values()]
+    .map((item, index) => ({ item, index, score: readinessScore(item) }))
+    .sort((left, right) => right.score - left.score || left.index - right.index)
+    .map(({ item }) => item);
 }
 
-module.exports = { streamEndpoint, normalizeStream, aggregateStreams };
+module.exports = { streamEndpoint, normalizeStream, aggregateStreams, readinessScore };

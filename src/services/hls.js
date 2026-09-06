@@ -1,6 +1,6 @@
-const fetch = require("node-fetch");
 const logger = require("../logger");
 const { sanitizeUrl } = require("../utils/security");
+const { safeRemoteFetch, safeRemoteText } = require("./safeRemoteFetch");
 
 function parseAttributes(line) {
   const attrs = {};
@@ -67,14 +67,11 @@ function pickTrack(tracks, preferredLangs) {
 }
 
 async function fetchText(url) {
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`Failed to fetch ${sanitizeUrl(url)} (${res.status})`);
-  }
-  return res.text();
+  try { return (await safeRemoteText(url)).text; }
+  catch (error) { throw new Error(`Failed to fetch ${sanitizeUrl(url)}: ${error.message}`); }
 }
 
-async function downloadVttFromM3u8(uri, baseUrl, maxSegments = 300) {
+async function downloadVttFromM3u8(uri, baseUrl, maxSegments = 10000) {
   const playlistUrl = resolveUrl(baseUrl, uri);
   const playlistText = await fetchText(playlistUrl);
   const lines = playlistText.split(/\r?\n/);
@@ -83,7 +80,7 @@ async function downloadVttFromM3u8(uri, baseUrl, maxSegments = 300) {
     const line = lines[i].trim();
     if (!line || line.startsWith("#")) continue;
     segments.push(resolveUrl(playlistUrl, line));
-    if (segments.length >= maxSegments) break;
+    if (segments.length > maxSegments) throw new Error(`Subtitle playlist exceeds the safe limit of ${maxSegments} segments`);
   }
 
   if (segments.length === 0) {
@@ -92,35 +89,28 @@ async function downloadVttFromM3u8(uri, baseUrl, maxSegments = 300) {
 
   let output = "WEBVTT\n\n";
   for (const seg of segments) {
-    try {
-      const segText = await fetchText(seg);
-      const withoutHeader = segText.replace(/^\uFEFF?WEBVTT[^\r\n]*(?:\r?\n)+/i, "").trim();
-      output += `${withoutHeader}\n\n`;
-    } catch (err) {
-      logger.warn("Failed to fetch subtitle segment", {
-        segment: sanitizeUrl(seg),
-        err: err.message,
-      });
-    }
+    const segText = await fetchText(seg);
+    const withoutHeader = segText.replace(/^\uFEFF?WEBVTT[^\r\n]*(?:\r?\n)+/i, "").trim();
+    output += `${withoutHeader}\n\n`;
   }
   return output;
 }
 
 async function downloadSubtitle(track, masterUrl) {
   const resolved = resolveUrl(masterUrl, track.uri);
-  const res = await fetch(resolved);
+  const { response: res, url: finalUrl } = await safeRemoteFetch(resolved);
   if (!res.ok) {
     throw new Error(`Subtitle fetch failed ${sanitizeUrl(resolved)} (${res.status})`);
   }
   const contentType = res.headers.get("content-type") || "";
-  const isVtt = contentType.includes("vtt") || resolved.endsWith(".vtt");
-  const isM3u8 = contentType.includes("mpegurl") || resolved.endsWith(".m3u8");
+  const isVtt = contentType.includes("vtt") || finalUrl.endsWith(".vtt");
+  const isM3u8 = contentType.includes("mpegurl") || finalUrl.endsWith(".m3u8");
 
   if (isVtt) {
     return res.text();
   }
   if (isM3u8) {
-    return downloadVttFromM3u8(track.uri, masterUrl);
+    return downloadVttFromM3u8(finalUrl, finalUrl);
   }
 
   // Last resort: treat as text.

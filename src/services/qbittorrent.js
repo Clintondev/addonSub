@@ -146,7 +146,7 @@ async function acquireTorrentUnlocked(source, onProgress = () => {}) {
   if (!files.length) throw new Error("Torrent metadata timeout");
   const selected = chooseFile(files, source.fileIdx);
   if (!selected) throw new Error("No video file found in torrent");
-  const used = directorySize(config.mediaDir);
+  const used = directorySize(config.storageDir);
   const additionalBytes = Math.max(0, selected.size * (1 - Number(selected.progress || 0)));
   if (used + additionalBytes > config.maxStorageBytes) throw new Error("Storage limit would be exceeded by this download");
   await selectOnlyFile(hash, selected, files);
@@ -209,4 +209,4 @@ async function acquireTorrent(source, onProgress = () => {}) {
   return withTorrentLock(hash, () => acquireTorrentUnlocked(source, onProgress));
 }
 
-module.exports = { request, getTorrent, getFiles, chooseFile, acquireTorrent, directorySize, forceRecheck, isPausedState, torrentStorageRoot, torrentFilePathCandidates, resolveTorrentFilePath };
+module.exports = { request, getTorrent, getFiles, chooseFile, acquireTorrent, directorySize, forceRecheck, isPausedState, stopTorrent, torrentStorageRoot, torrentFilePathCandidates, resolveTorrentFilePath };

@@ -2,10 +2,11 @@ const fs = require("fs");
 const path = require("path");
 const config = require("../config");
 const { safeChildPath } = require("../utils/security");
+const { withFileLock } = require("../utils/fileLock");
 
 const dbDir = safeChildPath(config.storageDir, "db");
 const dbFile = safeChildPath(dbDir, "sources.json");
-let state;
+const lockFile = safeChildPath(dbDir, "sources.lock");
 
 function readState() {
   try {
@@ -22,26 +23,25 @@ function persist(nextState) {
   const temporary = `${dbFile}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(temporary, JSON.stringify(nextState, null, 2), { encoding: "utf8", mode: 0o600 });
   fs.renameSync(temporary, dbFile);
-  state = nextState;
 }
 
 function upsert(source) {
-  const latest = readState();
-  const current = latest.sources[source.sourceId] || {};
-  const updated = { ...current, ...source, discoveredAt: current.discoveredAt || Date.now(), refreshedAt: Date.now() };
-  latest.sources[source.sourceId] = updated;
-  persist(latest);
-  return updated;
+  return withFileLock(lockFile, () => {
+    const latest = readState();
+    const current = latest.sources[source.sourceId] || {};
+    const updated = { ...current, ...source, discoveredAt: current.discoveredAt || Date.now(), refreshedAt: Date.now() };
+    latest.sources[source.sourceId] = updated;
+    persist(latest);
+    return updated;
+  });
 }
 
 function get(sourceId) {
-  state = readState();
-  return state.sources[sourceId] || null;
+  return readState().sources[sourceId] || null;
 }
 
 function list({ videoId, limit = 200 } = {}) {
-  state = readState();
-  return Object.values(state.sources)
+  return Object.values(readState().sources)
     .filter((source) => !videoId || source.videoId === videoId)
     .sort((a, b) => b.refreshedAt - a.refreshedAt)
     .slice(0, limit);
@@ -54,12 +54,14 @@ function publicSource(source) {
 }
 
 function remove(sourceId) {
-  const latest = readState();
-  const current = latest.sources[sourceId] || null;
-  if (!current) return null;
-  delete latest.sources[sourceId];
-  persist(latest);
-  return current;
+  return withFileLock(lockFile, () => {
+    const latest = readState();
+    const current = latest.sources[sourceId] || null;
+    if (!current) return null;
+    delete latest.sources[sourceId];
+    persist(latest);
+    return current;
+  });
 }
 
 module.exports = { upsert, get, list, publicSource, remove };
