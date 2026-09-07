@@ -5,6 +5,9 @@ const { promisify } = require("util");
 const config = require("../config");
 const logger = require("../logger");
 const { safeChildPath, stableHash } = require("../utils/security");
+const { writeJsonFileAtomic } = require("../utils/atomicJson");
+const { withStorageReservation } = require("./storageQuota");
+const { invalidateStorageUsage } = require("./storageUsage");
 
 const execFileAsync = promisify(execFile);
 const active = new Map();
@@ -152,7 +155,8 @@ async function generate(sourceId, input, subtitle, fingerprint) {
     fs.rmSync(target, { force: true });
     fs.renameSync(temporary, target);
     const metadata = { version: FORMAT_VERSION, fingerprint, generatedAt: new Date().toISOString(), outputBytes: fs.statSync(target).size, validation };
-    fs.writeFileSync(outputPath(sourceId, "metadata.json"), JSON.stringify(metadata, null, 2), "utf8");
+    writeJsonFileAtomic(outputPath(sourceId, "metadata.json"), metadata);
+    invalidateStorageUsage();
     logger.info("MKV local com legenda PT-BR pronto", { sourceId, ...validation, bytes: fs.statSync(target).size });
     return target;
   } catch (error) {
@@ -176,7 +180,8 @@ async function ensureEmbeddedPlayback(sourceId, input, subtitle) {
       const current = readMetadata(sourceId);
       if (fs.existsSync(target) && current?.version === FORMAT_VERSION && current.fingerprint === fingerprint
         && current.outputBytes === fs.statSync(target).size) return target;
-      return await generate(sourceId, input, subtitle, fingerprint);
+      const estimatedBytes = fs.statSync(input).size;
+      return await withStorageReservation(estimatedBytes, `embedded:${sourceId}`, () => generate(sourceId, input, subtitle, fingerprint));
     } finally { release(); }
   })().finally(() => active.delete(sourceId));
   active.set(sourceId, entry);
@@ -189,11 +194,20 @@ async function cancelEmbeddedPlayback(sourceId) {
   try { await entry?.promise; } catch (_) {}
 }
 
+function storageBytes(sourceId) {
+  const metadata = readMetadata(sourceId);
+  const target = outputPath(sourceId);
+  if (!metadata?.outputBytes || !fs.existsSync(target)) return 0;
+  try { return fs.statSync(target).size === metadata.outputBytes ? metadata.outputBytes : 0; }
+  catch (_) { return 0; }
+}
+
 module.exports = {
   buildEmbeddedArgs,
   cancelEmbeddedPlayback,
   ensureEmbeddedPlayback,
   expectedFingerprint,
   outputPath,
+  storageBytes,
   validateEmbeddedProbe,
 };

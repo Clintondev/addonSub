@@ -1,4 +1,5 @@
 const PT_BR_TERMS = [
+  [/\bHuh(?=\s*[?!.,…])/gi, "Hã"],
   [/\btelemóveis\b/gi, "celulares"],
   [/\btelemóvel\b/gi, "celular"],
   [/\bautocarros\b/gi, "ônibus"],
@@ -68,15 +69,34 @@ function dialogueTurns(text) {
   const normalizeTurn = (line) => line.replace(/\s+/g, " ").trim();
   const lines = value.split(/\n+/).map((line) => line.trim()).filter(Boolean);
   if (lines.length > 1 && lines.every((line) => /^[-–—]\s*/.test(line))) return lines.map((line) => normalizeTurn(line.replace(/^[-–—]\s*/, ""))).filter(Boolean);
-  const marked = value.replace(/^\s*[-–—]\s*/, "").split(/\s+[-–—]\s*(?=[A-ZÀ-Ý])/u).map(normalizeTurn).filter(Boolean);
+  const marked = value.replace(/^\s*[-–—]+\s*/, "").split(/\s+[-–—]{1,2}\s*(?=[\p{Lu}\p{Lt}])/u).map(normalizeTurn).filter(Boolean);
   return marked.length > 1 ? marked : [];
+}
+
+function sentenceFragments(text) {
+  return String(text || "").trim().split(/(?<=[.!?…])\s+(?=[\p{Lu}\p{Lt}])/u).map((part) => part.trim()).filter(Boolean);
 }
 
 function preserveDialogueLayout(sourceText, translatedText) {
   const sourceTurns = dialogueTurns(sourceText);
   const normalized = normalizeDialogueMarkers(translatedText);
-  if (sourceTurns.length < 2) return normalized;
-  const translatedTurns = dialogueTurns(normalized);
+  if (sourceTurns.length < 2) {
+    const alternatives = normalized.split(/(?<=[.!?…])\s*\/\s*(?=[\p{Lu}\p{Lt}])/u);
+    return alternatives.length > 1 ? alternatives[0].trim() : normalized;
+  }
+  let translatedTurns = dialogueTurns(normalized.replace(/\s*\/\s*(?=[\p{Lu}\p{Lt}])/gu, " -- "));
+  if (translatedTurns.length !== sourceTurns.length) {
+    const sourceSentenceCounts = sourceTurns.map((turn) => sentenceFragments(turn).length);
+    const fragments = sentenceFragments(normalized);
+    if (sourceSentenceCounts.reduce((sum, count) => sum + count, 0) === fragments.length) {
+      let cursor = 0;
+      translatedTurns = sourceSentenceCounts.map((count) => {
+        const turn = fragments.slice(cursor, cursor + count).join(" ");
+        cursor += count;
+        return turn;
+      });
+    }
+  }
   if (translatedTurns.length !== sourceTurns.length) return normalized;
   return translatedTurns.map((line) => `- ${line}`).join("\n");
 }
@@ -102,11 +122,17 @@ function mergeShortCues(cues, { maxChars = 105, maxGapSeconds = 0.65, minDuratio
   return output;
 }
 
-function displayChunks(text, maxLineChars = 42, maxLines = 2) {
+function displayChunks(text, maxLineChars = 42, maxLines = 2, keepTogetherTerms = []) {
   const normalized = normalizeDialogueMarkers(text);
   const turns = dialogueTurns(normalized);
   const wrapLines = (value) => {
-    const words = plainText(value).split(" ").filter(Boolean);
+    let protectedValue = plainText(value);
+    for (const term of [...new Set(keepTogetherTerms)].filter((item) => /\s/.test(item)).sort((a, b) => b.length - a.length)) {
+      const escaped = String(term).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const pattern = new RegExp(`(?<![\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`, "giu");
+      protectedValue = protectedValue.replace(pattern, (match) => match.replace(/\s+/g, "\u00a0"));
+    }
+    const words = protectedValue.split(" ").filter(Boolean);
     if (!words.length) return [""];
     const output = [];
     let line = "";
@@ -119,7 +145,7 @@ function displayChunks(text, maxLineChars = 42, maxLines = 2) {
       }
     }
     if (line) output.push(line);
-    return output;
+    return output.map((line) => line.replace(/\u00a0/g, " "));
   };
   const lines = turns.length > 1
     ? turns.flatMap((turn) => wrapLines(`- ${turn}`))
@@ -129,9 +155,9 @@ function displayChunks(text, maxLineChars = 42, maxLines = 2) {
   return chunks;
 }
 
-function finalizeCues(cues, { targetCps = 17, minDurationSeconds = 1, maxDurationSeconds = 7, gapSeconds = 0.08 } = {}) {
+function finalizeCues(cues, { targetCps = 17, minDurationSeconds = 1, maxDurationSeconds = 7, gapSeconds = 0.08, keepTogetherTerms = [] } = {}) {
   const displayCues = cues.flatMap((sourceCue) => {
-    const chunks = displayChunks(localizeBrazilianPortuguese(sourceCue.text));
+    const chunks = displayChunks(localizeBrazilianPortuguese(sourceCue.text), 42, 2, keepTogetherTerms);
     if (chunks.length === 1) return [{ ...sourceCue, text: chunks[0] }];
     const timing = cueTiming(sourceCue);
     if (!timing) return chunks.map((text) => ({ ...sourceCue, id: null, text }));
@@ -158,8 +184,8 @@ function finalizeCues(cues, { targetCps = 17, minDurationSeconds = 1, maxDuratio
   });
 }
 
-function analyzeCueIntegrity(cues, { maxCueSeconds = 20, maxLineChars = null } = {}) {
-  const stats = { cues: cues.length, invalid: 0, empty: 0, overlaps: 0, longCues: 0, overlongLines: 0, maxLineChars: 0, maxGapSeconds: 0, maxCueSeconds: 0 };
+function analyzeCueIntegrity(cues, { maxCueSeconds = 20, maxLineChars = null, maxLines = null } = {}) {
+  const stats = { cues: cues.length, invalid: 0, empty: 0, overlaps: 0, longCues: 0, overlongLines: 0, tooManyLines: 0, maxLines: 0, maxLineChars: 0, maxGapSeconds: 0, maxCueSeconds: 0 };
   let previousEnd = null;
   for (const cue of cues) {
     const timing = cueTiming(cue);
@@ -168,7 +194,10 @@ function analyzeCueIntegrity(cues, { maxCueSeconds = 20, maxLineChars = null } =
       continue;
     }
     if (!plainText(cue.text)) stats.empty++;
-    for (const line of String(cue.text || "").split("\n")) {
+    const lines = String(cue.text || "").split("\n");
+    stats.maxLines = Math.max(stats.maxLines, lines.length);
+    if (Number.isFinite(maxLines) && lines.length > maxLines) stats.tooManyLines++;
+    for (const line of lines) {
       stats.maxLineChars = Math.max(stats.maxLineChars, line.length);
       if (Number.isFinite(maxLineChars) && line.length > maxLineChars) stats.overlongLines++;
     }
@@ -191,6 +220,7 @@ function assertCueIntegrity(cues, options) {
   if (stats.empty) throw new Error(`Legenda contém ${stats.empty} falas vazias`);
   if (stats.longCues) throw new Error(`Legenda contém ${stats.longCues} falas com duração anormal (máximo ${stats.maxCueSeconds.toFixed(1)}s)`);
   if (stats.overlongLines) throw new Error(`Legenda contém ${stats.overlongLines} linhas acima de ${options.maxLineChars} caracteres (máximo ${stats.maxLineChars})`);
+  if (stats.tooManyLines) throw new Error(`Legenda contém ${stats.tooManyLines} falas acima de ${options.maxLines} linhas (máximo ${stats.maxLines})`);
   if (stats.overlaps > Math.max(2, Math.ceil(stats.cues * 0.01))) throw new Error(`Legenda contém sobreposições excessivas (${stats.overlaps})`);
   return stats;
 }

@@ -1,36 +1,44 @@
-const fs = require("fs");
 const config = require("../config");
 const { safeChildPath } = require("../utils/security");
+const { withFileLock } = require("../utils/fileLock");
+const { readJsonFile, writeJsonFileAtomic } = require("../utils/atomicJson");
 
 function metaPath(sourceId) {
   return safeChildPath(config.storageDir, "subtitles", sourceId, "state.json");
 }
 
+function lockPath(sourceId) {
+  return safeChildPath(config.storageDir, "subtitles", sourceId, "state.lock");
+}
+
 function readMeta(sourceId) {
-  try { return JSON.parse(fs.readFileSync(metaPath(sourceId), "utf8")); } catch (_) { return {}; }
+  return readJsonFile(metaPath(sourceId), { fallback: () => ({}), validate: (value) => Boolean(value && typeof value === "object" && !Array.isArray(value)) });
 }
 
 function writeMeta(sourceId, data) {
-  const file = metaPath(sourceId);
-  fs.mkdirSync(require("path").dirname(file), { recursive: true });
-  const temporary = `${file}.tmp`;
-  fs.writeFileSync(temporary, JSON.stringify(data, null, 2), "utf8");
-  fs.renameSync(temporary, file);
+  writeJsonFileAtomic(metaPath(sourceId), data);
+}
+
+function transitionIf(sourceId, stage, patch = {}, predicate = () => true) {
+  return withFileLock(lockPath(sourceId), () => {
+    const current = readMeta(sourceId);
+    if (!predicate(current)) return current;
+    const terminalCleanup = stage === "ready"
+      ? { error: null, extractionError: null }
+      : {};
+    const normalizedPatch = { ...terminalCleanup, ...patch };
+    const event = { stage, at: new Date().toISOString(), ...normalizedPatch };
+    const history = [...(current.history || [])];
+    if (current.stage === stage && history.length) history[history.length - 1] = event;
+    else history.push(event);
+    const updated = { ...current, sourceId, stage, updatedAt: event.at, ...normalizedPatch, history };
+    writeMeta(sourceId, updated);
+    return updated;
+  });
 }
 
 function transition(sourceId, stage, patch = {}) {
-  const current = readMeta(sourceId);
-  const terminalCleanup = stage === "ready"
-    ? { error: null, extractionError: null }
-    : {};
-  const normalizedPatch = { ...terminalCleanup, ...patch };
-  const event = { stage, at: new Date().toISOString(), ...normalizedPatch };
-  const history = [...(current.history || [])];
-  if (current.stage === stage && history.length) history[history.length - 1] = event;
-  else history.push(event);
-  const updated = { ...current, sourceId, stage, updatedAt: event.at, ...normalizedPatch, history };
-  writeMeta(sourceId, updated);
-  return updated;
+  return transitionIf(sourceId, stage, patch);
 }
 
-module.exports = { readMeta, writeMeta, mergeMeta: (id, patch) => transition(id, readMeta(id).stage || "discovered", patch), recordJob: (id, patch) => transition(id, patch.status || "unknown", patch), transition };
+module.exports = { readMeta, writeMeta, mergeMeta: (id, patch) => transition(id, readMeta(id).stage || "discovered", patch), recordJob: (id, patch) => transition(id, patch.status || "unknown", patch), transition, transitionIf };

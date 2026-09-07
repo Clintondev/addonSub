@@ -1,0 +1,57 @@
+module.exports = [
+  {
+    files: ["src/**/*.js", "test/**/*.js", "scripts/**/*.js"],
+    ignores: ["src/manager/**/*.js"],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: "commonjs",
+      globals: {
+        AbortController: "readonly",
+        Atomics: "readonly",
+        Buffer: "readonly",
+        Intl: "readonly",
+        SharedArrayBuffer: "readonly",
+        URL: "readonly",
+        URLSearchParams: "readonly",
+        __dirname: "readonly",
+        clearInterval: "readonly",
+        clearTimeout: "readonly",
+        console: "readonly",
+        fetch: "readonly",
+        module: "readonly",
+        process: "readonly",
+        require: "readonly",
+        setInterval: "readonly",
+        setTimeout: "readonly",
+      },
+    },
+    linterOptions: { reportUnusedDisableDirectives: "error" },
+    rules: {
+      "no-undef": "error",
+      "no-unreachable": "error",
+      "no-unused-vars": ["error", { argsIgnorePattern: "^_", caughtErrorsIgnorePattern: "^_" }],
+    },
+  },
+  {
+    files: ["src/manager/**/*.js"],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: "script",
+      globals: {
+        CSS: "readonly",
+        URL: "readonly",
+        clearTimeout: "readonly",
+        document: "readonly",
+        fetch: "readonly",
+        navigator: "readonly",
+        sessionStorage: "readonly",
+        setTimeout: "readonly",
+      },
+    },
+    rules: {
+      "no-undef": "error",
+      "no-unreachable": "error",
+      "no-unused-vars": ["error", { argsIgnorePattern: "^_", caughtErrorsIgnorePattern: "^_" }],
+    },
+  },
+];

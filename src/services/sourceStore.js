@@ -1,28 +1,21 @@
-const fs = require("fs");
-const path = require("path");
 const config = require("../config");
 const { safeChildPath } = require("../utils/security");
 const { withFileLock } = require("../utils/fileLock");
+const { readJsonFile, writeJsonFileAtomic } = require("../utils/atomicJson");
 
 const dbDir = safeChildPath(config.storageDir, "db");
 const dbFile = safeChildPath(dbDir, "sources.json");
 const lockFile = safeChildPath(dbDir, "sources.lock");
 
 function readState() {
-  try {
-    const loaded = JSON.parse(fs.readFileSync(dbFile, "utf8"));
-    if (!loaded.sources || typeof loaded.sources !== "object") throw new Error("Invalid source store");
-    return loaded;
-  } catch (_) {
-    return { version: 1, sources: {} };
-  }
+  return readJsonFile(dbFile, {
+    fallback: () => ({ version: 1, sources: {} }),
+    validate: (loaded) => Boolean(loaded && loaded.sources && typeof loaded.sources === "object" && !Array.isArray(loaded.sources)),
+  });
 }
 
 function persist(nextState) {
-  fs.mkdirSync(dbDir, { recursive: true });
-  const temporary = `${dbFile}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(temporary, JSON.stringify(nextState, null, 2), { encoding: "utf8", mode: 0o600 });
-  fs.renameSync(temporary, dbFile);
+  writeJsonFileAtomic(dbFile, nextState);
 }
 
 function upsert(source) {
@@ -49,7 +42,8 @@ function list({ videoId, limit = 200 } = {}) {
 
 function publicSource(source) {
   if (!source) return null;
-  const { url, ...safe } = source;
+  const safe = { ...source };
+  delete safe.url;
   return safe;
 }
 

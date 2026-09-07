@@ -2,6 +2,8 @@ const fs = require("fs");
 const path = require("path");
 const config = require("../config");
 const { safeChildPath, safeRelativePath } = require("../utils/security");
+const { fetchWithTimeout } = require("../utils/fetchWithTimeout");
+const { reserveStorage } = require("./storageQuota");
 
 const VIDEO_EXTENSIONS = new Set([".mkv", ".mp4", ".avi", ".mov", ".m4v", ".webm", ".ts", ".m2ts"]);
 const torrentLocks = new Map();
@@ -9,11 +11,11 @@ const torrentLocks = new Map();
 function delay(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
 async function request(endpoint, { method = "GET", body } = {}) {
-  const response = await fetch(`${config.qbittorrentUrl}/api/v2${endpoint}`, {
+  const response = await fetchWithTimeout(`${config.qbittorrentUrl}/api/v2${endpoint}`, {
     method,
     headers: body ? { "Content-Type": "application/x-www-form-urlencoded" } : undefined,
     body: body ? new URLSearchParams(body) : undefined,
-  });
+  }, config.internalHttpTimeoutMs);
   const text = await response.text();
   if (!response.ok) throw new Error(`qBittorrent ${endpoint} returned ${response.status}`);
   return text;
@@ -53,14 +55,6 @@ async function selectOnlyFile(hash, selected, files) {
   const skipped = files.filter((file) => file.index !== selected.index).map((file) => file.index);
   if (skipped.length) await request("/torrents/filePrio", { method: "POST", body: { hash, id: skipped.join("|"), priority: "0" } });
   await request("/torrents/filePrio", { method: "POST", body: { hash, id: String(selected.index), priority: "7" } });
-}
-
-function directorySize(root) {
-  if (!fs.existsSync(root)) return 0;
-  return fs.readdirSync(root, { withFileTypes: true }).reduce((total, entry) => {
-    const child = path.join(root, entry.name);
-    return total + (entry.isDirectory() ? directorySize(child) : entry.isFile() ? fs.statSync(child).size : 0);
-  }, 0);
 }
 
 async function stopTorrent(hash) {
@@ -146,48 +140,53 @@ async function acquireTorrentUnlocked(source, onProgress = () => {}) {
   if (!files.length) throw new Error("Torrent metadata timeout");
   const selected = chooseFile(files, source.fileIdx);
   if (!selected) throw new Error("No video file found in torrent");
-  const used = directorySize(config.storageDir);
   const additionalBytes = Math.max(0, selected.size * (1 - Number(selected.progress || 0)));
-  if (used + additionalBytes > config.maxStorageBytes) throw new Error("Storage limit would be exceeded by this download");
-  await selectOnlyFile(hash, selected, files);
-  await startTorrent(hash);
+  const releaseStorage = await reserveStorage(additionalBytes, `torrent:${source.sourceId}`);
+  try {
+    await selectOnlyFile(hash, selected, files);
+    await startTorrent(hash);
 
-  const deadline = Date.now() + config.torrentDownloadTimeoutMs;
-  let lastProgress = -1;
-  let lastProgressAt = Date.now();
-  while (Date.now() < deadline) {
-    const current = (await getFiles(hash)).find((file) => file.index === selected.index);
-    if (!current) throw new Error("Selected torrent file disappeared");
-    const torrent = await getTorrent(hash);
-    if (!torrent) throw new Error("Torrent disappeared from qBittorrent");
-    if (isPausedState(torrent.state)) await startTorrent(hash);
-    const percent = Math.floor(current.progress * 100);
-    if (current.progress > lastProgress) {
-      lastProgress = current.progress;
-      lastProgressAt = Date.now();
-    } else if (Date.now() - lastProgressAt >= config.torrentNoProgressTimeoutMs
-      && (Number(torrent.num_seeds || 0) === 0 || Number(torrent.availability || 0) < 1)) {
-      await stopTorrent(hash);
-      throw new Error("Torrent sem progresso ou sem disponibilidade completa; tentando outra fonte");
+    const deadline = Date.now() + config.torrentDownloadTimeoutMs;
+    let lastProgress = -1;
+    let lastProgressAt = Date.now();
+    while (Date.now() < deadline) {
+      const current = (await getFiles(hash)).find((file) => file.index === selected.index);
+      if (!current) throw new Error("Selected torrent file disappeared");
+      const torrent = await getTorrent(hash);
+      if (!torrent) throw new Error("Torrent disappeared from qBittorrent");
+      if (isPausedState(torrent.state)) await startTorrent(hash);
+      const percent = Math.floor(current.progress * 100);
+      if (current.progress > lastProgress) {
+        lastProgress = current.progress;
+        lastProgressAt = Date.now();
+      } else if (Date.now() - lastProgressAt >= config.torrentNoProgressTimeoutMs
+        && (Number(torrent.num_seeds || 0) === 0 || Number(torrent.availability || 0) < 1)) {
+        throw new Error("Torrent sem progresso ou sem disponibilidade completa; tentando outra fonte");
+      }
+      await onProgress({
+        stage: "acquiring",
+        progress: Math.min(35, 5 + Math.floor(percent * 0.3)),
+        downloadProgress: percent,
+        downloadedBytes: Math.floor(current.size * current.progress),
+        totalBytes: current.size,
+        downloadSpeedBytes: torrent?.dlspeed || 0,
+        etaSeconds: Number.isFinite(torrent?.eta) ? torrent.eta : null,
+      });
+      if (current.progress >= 1) {
+        await stopTorrent(hash);
+        const localPath = resolveTorrentFilePath(torrent, source.sourceId, current.name);
+        if (!localPath) throw new Error("Downloaded media file was not found in shared storage");
+        return { localPath, fileName: current.name, size: current.size, fileIdx: current.index };
+      }
+      await delay(3000);
     }
-    await onProgress({
-      stage: "acquiring",
-      progress: Math.min(35, 5 + Math.floor(percent * 0.3)),
-      downloadProgress: percent,
-      downloadedBytes: Math.floor(current.size * current.progress),
-      totalBytes: current.size,
-      downloadSpeedBytes: torrent?.dlspeed || 0,
-      etaSeconds: Number.isFinite(torrent?.eta) ? torrent.eta : null,
-    });
-    if (current.progress >= 1) {
-      await stopTorrent(hash);
-      const localPath = resolveTorrentFilePath(torrent, source.sourceId, current.name);
-      if (!localPath) throw new Error("Downloaded media file was not found in shared storage");
-      return { localPath, fileName: current.name, size: current.size, fileIdx: current.index };
-    }
-    await delay(3000);
+    throw new Error("Torrent download timeout");
+  } catch (error) {
+    await stopTorrent(hash).catch(() => {});
+    throw error;
+  } finally {
+    await releaseStorage();
   }
-  throw new Error("Torrent download timeout");
 }
 
 async function withTorrentLock(hash, callback) {
@@ -209,4 +208,4 @@ async function acquireTorrent(source, onProgress = () => {}) {
   return withTorrentLock(hash, () => acquireTorrentUnlocked(source, onProgress));
 }
 
-module.exports = { request, getTorrent, getFiles, chooseFile, acquireTorrent, directorySize, forceRecheck, isPausedState, stopTorrent, torrentStorageRoot, torrentFilePathCandidates, resolveTorrentFilePath };
+module.exports = { request, getTorrent, getFiles, chooseFile, acquireTorrent, forceRecheck, isPausedState, stopTorrent, torrentStorageRoot, torrentFilePathCandidates, resolveTorrentFilePath };

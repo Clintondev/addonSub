@@ -6,8 +6,9 @@ const { applyPgsPositions, parsePgsPositions, withPositionSettings } = require("
 const { finalizeCues, normalizeDialogueMarkers, parseTimestamp, preserveDialogueLayout } = require("./subtitleQuality");
 const { safeChildPath } = require("../utils/security");
 const { vttCuesToAss } = require("./ass");
+const { inferProtectedTerms } = require("./translate");
 
-const LAYOUT_VERSION = 3;
+const LAYOUT_VERSION = 4;
 
 function writeAss(dir, cues) {
   const assPath = path.join(dir, "pt-BR.ass");
@@ -56,6 +57,7 @@ function repairSubtitleLayout(sourceId, { backup = false, force = false } = {}) 
   const supPath = path.join(dir, `track-${track[1]}.sup`);
   if (!fs.existsSync(supPath)) return { skipped: "sup-missing" };
   const sourceCues = applyPgsPositions(parseVtt(fs.readFileSync(originalPath, "utf8")), parsePgsPositions(fs.readFileSync(supPath)));
+  const protectedTerms = inferProtectedTerms(sourceCues);
   const finalCues = parseVtt(fs.readFileSync(finalPath, "utf8"));
   let cursor = 0;
   let positioned = 0;
@@ -76,7 +78,7 @@ function repairSubtitleLayout(sourceId, { backup = false, force = false } = {}) 
     if (sourceTime.settings) { time = withPositionSettings(time, sourceTime.settings); positioned++; }
     return { ...cue, time, text };
   });
-  const formatted = finalizeCues(repaired.map((cue) => ({ ...cue, text: normalizeDialogueMarkers(cue.text) })));
+  const formatted = finalizeCues(repaired.map((cue) => ({ ...cue, text: normalizeDialogueMarkers(cue.text) })), { keepTogetherTerms: protectedTerms });
   if (backup) {
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     fs.copyFileSync(finalPath, path.join(dir, `pt-BR-before-layout-${stamp}.vtt`));

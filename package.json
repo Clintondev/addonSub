@@ -8,7 +8,10 @@
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
     "worker": "node src/worker.js",
-    "test": "node --test --test-reporter=spec"
+    "lint": "eslint .",
+    "test": "node --test --test-reporter=spec",
+    "test:coverage": "node scripts/checkCoverage.js",
+    "check": "npm run lint && npm test && npm audit --omit=dev"
   },
   "engines": {
     "node": ">=18.18"
@@ -16,13 +19,14 @@
   "dependencies": {
     "bullmq": "^5.8.3",
     "dotenv": "^16.3.1",
-    "express": "^4.18.2",
+    "express": "^5.2.1",
     "fast-xml-parser": "^5.11.1",
     "ioredis": "^5.3.2",
     "morgan": "^1.10.0",
     "node-fetch": "^2.7.0"
   },
   "devDependencies": {
+    "eslint": "^10.10.0",
     "nodemon": "^3.0.1"
   }
 }

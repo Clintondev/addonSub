@@ -78,12 +78,17 @@ function isPrivateAddress(address) {
 }
 
 async function assertSafeRemoteUrl(value) {
+  return (await resolveSafeRemoteUrl(value)).url;
+}
+
+async function resolveSafeRemoteUrl(value) {
   const parsed = new URL(value);
   if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error("Unsafe media URL");
   if (parsed.hostname.toLowerCase() === "localhost" || parsed.hostname.toLowerCase().endsWith(".local")) throw new Error("Private media destinations are blocked");
   const addresses = net.isIP(parsed.hostname) ? [{ address: parsed.hostname }] : await dns.lookup(parsed.hostname, { all: true, verbatim: true });
   if (!addresses.length || addresses.some((item) => isPrivateAddress(item.address))) throw new Error("Private media destinations are blocked");
-  return parsed;
+  const selected = addresses[0];
+  return { url: parsed, address: selected.address, family: selected.family || net.isIP(selected.address) };
 }
 
-module.exports = { stableHash, sanitizeUrl, redact, signPath, verifyPath, safeChildPath, safeRelativePath, isPrivateAddress, assertSafeRemoteUrl };
+module.exports = { stableHash, sanitizeUrl, redact, signPath, verifyPath, safeChildPath, safeRelativePath, isPrivateAddress, assertSafeRemoteUrl, resolveSafeRemoteUrl };

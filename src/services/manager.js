@@ -5,9 +5,10 @@ const sourceStore = require("./sourceStore");
 const watchStore = require("./watchStore");
 const { parseVideoId } = require("./videoId");
 const { readMeta } = require("./metadata");
-const { translationStatus, subtitlePath } = require("./subtitleService");
-const { cancelHls, outputPath: hlsOutputPath } = require("./hlsPlayback");
-const { cancelEmbeddedPlayback } = require("./embeddedPlayback");
+const { translationStatus } = require("./subtitleService");
+const { cancelHls, storageBytes: hlsStorageBytes } = require("./hlsPlayback");
+const { cancelEmbeddedPlayback, storageBytes: playbackStorageBytes } = require("./embeddedPlayback");
+const { invalidateStorageUsage } = require("./storageUsage");
 const { request } = require("./qbittorrent");
 const { safeChildPath } = require("../utils/security");
 
@@ -19,7 +20,7 @@ function directorySize(root) {
   if (!fs.existsSync(root)) return 0;
   return fs.readdirSync(root, { withFileTypes: true }).reduce((total, entry) => {
     const child = path.join(root, entry.name);
-    return total + (entry.isDirectory() ? directorySize(child) : entry.isFile() ? existsSize(child) : 0);
+    return total + (entry.isFile() ? existsSize(child) : 0);
   }, 0);
 }
 
@@ -29,8 +30,6 @@ function episodeView(source) {
   const meta = readMeta(source.sourceId);
   const status = translationStatus(source.sourceId);
   const subtitlesDir = safeChildPath(config.storageDir, "subtitles", source.sourceId);
-  const hlsDir = safeChildPath(config.hlsDir, source.sourceId);
-  const playbackDir = safeChildPath(config.playbackDir, source.sourceId);
   const mediaReady = Boolean(source.localPath && existsSize(source.localPath));
   const downloadProgress = meta.downloadProgress ?? (mediaReady ? 100 : 0);
   const downloadStatus = mediaReady ? "ready"
@@ -64,6 +63,10 @@ function episodeView(source) {
       sourceMethod,
       languageDeclared: meta.languageDeclared || null,
       languageDetected: meta.languageDetected || meta.from || null,
+      translationSourceLanguage: meta.translationSourceLanguage || meta.from || null,
+      translationRoute: meta.translationRoute || null,
+      sourceAudioLanguage: meta.sourceAudioLanguage || null,
+      sourceAudioConfidence: meta.sourceAudioConfidence || null,
       translated: meta.translated ?? null,
       provider: meta.translationProvider || null,
       alignment: meta.alignmentQuality || null,
@@ -71,19 +74,20 @@ function episodeView(source) {
       finalQuality: meta.finalQuality || null,
       cues: meta.cues || null,
       updatedAt: meta.updatedAt || null,
+      hasRawOriginal: existsSize(path.join(subtitlesDir, "original-raw.vtt")) > 0,
       hasOriginal: existsSize(path.join(subtitlesDir, "original.vtt")) > 0,
       hasFinal: existsSize(path.join(subtitlesDir, "pt-BR.vtt")) > 0,
       outputs: {
         vtt: existsSize(path.join(subtitlesDir, "pt-BR.vtt")) > 0,
         srt: existsSize(path.join(subtitlesDir, "pt-BR.srt")) > 0,
-        embedded: directorySize(playbackDir) > 0,
+        embedded: playbackStorageBytes(source.sourceId) > 0,
       },
     },
     storage: {
       mediaBytes: source.localPath ? existsSize(source.localPath) : 0,
       subtitleBytes: directorySize(subtitlesDir),
-      hlsBytes: directorySize(hlsDir),
-      playbackBytes: directorySize(playbackDir),
+      hlsBytes: hlsStorageBytes(source.sourceId),
+      playbackBytes: playbackStorageBytes(source.sourceId),
     },
   };
 }
@@ -157,26 +161,35 @@ async function deleteArtifacts(sourceId, { media = true, subtitles = true, hls =
   if (subtitles) fs.rmSync(safeChildPath(config.storageDir, "subtitles", sourceId), { recursive: true, force: true });
   if (hls) fs.rmSync(safeChildPath(config.hlsDir, sourceId), { recursive: true, force: true });
   if (playback) fs.rmSync(safeChildPath(config.playbackDir, sourceId), { recursive: true, force: true });
+  invalidateStorageUsage();
   return source;
 }
 
-function storageView(shows = null, sourceCount = null) {
+function storageView(shows = null, sourceCount = null, actualUsedBytes = null) {
   if (Array.isArray(shows)) {
-    const totals = shows.reduce((sum, show) => ({
-      mediaBytes: sum.mediaBytes + show.episodes.reduce((value, item) => value + item.storage.mediaBytes, 0),
-      subtitleBytes: sum.subtitleBytes + show.episodes.reduce((value, item) => value + item.storage.subtitleBytes, 0),
-      hlsBytes: sum.hlsBytes + show.episodes.reduce((value, item) => value + item.storage.hlsBytes, 0),
-      playbackBytes: sum.playbackBytes + show.episodes.reduce((value, item) => value + item.storage.playbackBytes, 0),
-    }), { mediaBytes: 0, subtitleBytes: 0, hlsBytes: 0, playbackBytes: 0 });
-    return { ...totals, usedBytes: totals.mediaBytes + totals.subtitleBytes + totals.hlsBytes + totals.playbackBytes, maxBytes: config.maxStorageBytes, sources: sourceCount ?? sourceStore.list({ limit: 5000 }).length };
+    const seenMedia = new Set();
+    const seenSources = new Set();
+    const totals = { mediaBytes: 0, subtitleBytes: 0, hlsBytes: 0, playbackBytes: 0 };
+    for (const item of shows.flatMap((show) => show.episodes)) {
+      const mediaKey = item.localPath ? path.resolve(item.localPath) : null;
+      if (mediaKey && !seenMedia.has(mediaKey)) { seenMedia.add(mediaKey); totals.mediaBytes += item.storage.mediaBytes; }
+      if (!seenSources.has(item.sourceId)) {
+        seenSources.add(item.sourceId);
+        totals.subtitleBytes += item.storage.subtitleBytes;
+        totals.hlsBytes += item.storage.hlsBytes;
+        totals.playbackBytes += item.storage.playbackBytes;
+      }
+    }
+    const categorized = totals.mediaBytes + totals.subtitleBytes + totals.hlsBytes + totals.playbackBytes;
+    return { ...totals, usedBytes: actualUsedBytes ?? categorized, maxBytes: config.maxStorageBytes, sources: sourceCount ?? sourceStore.list({ limit: 5000 }).length };
   }
   return {
-    usedBytes: directorySize(config.storageDir),
+    usedBytes: actualUsedBytes || 0,
     maxBytes: config.maxStorageBytes,
-    mediaBytes: directorySize(config.mediaDir),
-    subtitleBytes: directorySize(path.join(config.storageDir, "subtitles")),
-    hlsBytes: directorySize(config.hlsDir),
-    playbackBytes: directorySize(config.playbackDir),
+    mediaBytes: 0,
+    subtitleBytes: 0,
+    hlsBytes: 0,
+    playbackBytes: 0,
     sources: sourceStore.list({ limit: 5000 }).length,
   };
 }

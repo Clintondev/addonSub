@@ -38,6 +38,10 @@ function normalizeStream(stream, addon, type, videoId) {
   // externalUrl/ytId bypass the gateway, so the selected source could never
   // receive a prepared PT-AUTO subtitle. Only resolvable media is advertised.
   if (!stream || typeof stream !== "object" || (!stream.url && !stream.infoHash)) return null;
+  if (stream.url) {
+    try { if (!["http:", "https:"].includes(new URL(stream.url).protocol)) return null; }
+    catch (_) { return null; }
+  }
   const sourceId = createSourceId(stream, addon.id, videoId);
   const record = sourceStore.upsert({
     sourceId,
@@ -53,6 +57,9 @@ function normalizeStream(stream, addon, type, videoId) {
     name: stream.name || addon.name,
     title: stream.title || "",
     behaviorHints: stream.behaviorHints || {},
+    originalLanguage: stream.originalLanguage || stream.original_language
+      || stream.behaviorHints?.originalLanguage || stream.behaviorHints?.original_language || null,
+    audioLanguage: stream.audioLanguage || stream.behaviorHints?.audioLanguage || null,
   });
   return { stream, record, key: dedupeKey(stream, addon.id, videoId) };
 }

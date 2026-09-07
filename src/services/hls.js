@@ -1,6 +1,7 @@
 const logger = require("../logger");
 const { sanitizeUrl } = require("../utils/security");
 const { safeRemoteFetch, safeRemoteText } = require("./safeRemoteFetch");
+const { canonicalLanguage, languageMatches, subtitleLanguageOrder, translationRoute } = require("./languageStrategy");
 
 function parseAttributes(line) {
   const attrs = {};
@@ -22,7 +23,7 @@ function parseAttributes(line) {
 function resolveUrl(base, ref) {
   try {
     return new URL(ref, base).toString();
-  } catch (err) {
+  } catch (_err) {
     return ref;
   }
 }
@@ -38,7 +39,7 @@ function parseSubtitlesFromMaster(text) {
     if (!attrs.URI) continue;
     tracks.push({
       uri: attrs.URI,
-      lang: (attrs.LANGUAGE || attrs.LANG || "").toLowerCase(),
+      lang: canonicalLanguage(attrs.LANGUAGE || attrs.LANG),
       name: attrs.NAME || attrs.LANGUAGE || "sub",
       forced: attrs.FORCED === "YES",
       autoselect: attrs.AUTOSELECT === "YES",
@@ -47,15 +48,33 @@ function parseSubtitlesFromMaster(text) {
   return tracks;
 }
 
+function parseAudioFromMaster(text) {
+  return text.split(/\r?\n/).filter((line) => line.startsWith("#EXT-X-MEDIA") && line.includes("TYPE=AUDIO"))
+    .map((line, index) => {
+      const attrs = parseAttributes(line);
+      const title = attrs.NAME || "";
+      return {
+        ffIndex: index,
+        lang: canonicalLanguage(attrs.LANGUAGE || attrs.LANG),
+        title,
+        disposition: {
+          default: attrs.DEFAULT === "YES",
+          original: /\boriginal\b|\bnative\b|idioma original/i.test(title),
+          dub: /\bdub(?:bed)?\b|dublado/i.test(title),
+        },
+      };
+    });
+}
+
 function pickTrack(tracks, preferredLangs) {
   if (!Array.isArray(tracks) || tracks.length === 0) return null;
   const avoidForced = tracks.some((t) => t.forced === true);
-  const normalized = tracks.map((t) => ({ ...t, lang: (t.lang || "").toLowerCase() }));
+  const normalized = tracks.map((t) => ({ ...t, lang: canonicalLanguage(t.lang) }));
 
   // Priorize explicit languages.
   for (const pref of preferredLangs) {
     const found = normalized.find(
-      (t) => t.lang === pref && (!avoidForced ? true : t.forced === false)
+      (t) => languageMatches(t.lang, pref) && (!avoidForced ? true : t.forced === false)
     );
     if (found) return found;
   }
@@ -121,10 +140,12 @@ async function extractHlsSubtitle(masterUrl, options = {}) {
   const preferredLangs = options.preferredLangs || ["eng", "en", "spa", "fra", "ita"];
   const playlistText = await fetchText(masterUrl);
   const tracks = parseSubtitlesFromMaster(playlistText);
+  const audioTracks = parseAudioFromMaster(playlistText);
   if (!tracks.length) {
     throw new Error("Nenhuma trilha de legenda HLS encontrada");
   }
-  const track = pickTrack(tracks, preferredLangs);
+  const strategy = subtitleLanguageOrder({ source: options.source, audioTracks, preferredLangs, targetLocale: options.targetLocale });
+  const track = pickTrack(tracks, strategy.languages);
   if (!track) throw new Error("Falha ao selecionar trilha de legenda");
 
   logger.info("Selecionada trilha HLS", {
@@ -139,9 +160,17 @@ async function extractHlsSubtitle(masterUrl, options = {}) {
     lang: track.lang || "und",
     name: track.name,
     content: vttText,
+    sourceAudioIndex: null,
+    sourceAudioLanguage: strategy.originalAudio?.lang || "und",
+    sourceAudioReason: strategy.originalAudio?.reason || "unavailable",
+    sourceAudioConfidence: strategy.originalAudio?.confidence || "unknown",
+    translationRoute: translationRoute(track.lang, strategy.originalAudio),
   };
 }
 
 module.exports = {
   extractHlsSubtitle,
+  parseAudioFromMaster,
+  parseSubtitlesFromMaster,
+  pickTrack,
 };

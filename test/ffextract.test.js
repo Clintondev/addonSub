@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { pickTextTrack, pickPgsTrack, srtToVtt } = require("../src/services/ffextract");
+const { extractFileSubtitle, pickTextTrack, pickPgsTrack, pgsOcrSupported, rankedTracks, srtToVtt } = require("../src/services/ffextract");
 
 test("prefers Brazilian Portuguese textual subtitles before English", () => {
   const tracks = [{ ffIndex: 2, codec: "subrip", lang: "eng", forced: false }, { ffIndex: 3, codec: "ass", lang: "pob", forced: false }];
@@ -21,6 +21,39 @@ test("prefers a complete PGS track even when a forced track has the preferred la
     { ffIndex: 4, codec: "hdmv_pgs_subtitle", lang: "eng", title: "English Full", forced: false },
   ];
   assert.equal(pickPgsTrack(tracks, ["pob", "eng"]).ffIndex, 4);
+});
+
+test("prefers a full original-language PGS track over an intermediate textual translation", () => {
+  const tracks = [
+    { ffIndex: 3, codec: "subrip", lang: "eng", title: "English Full", forced: false },
+    { ffIndex: 4, codec: "hdmv_pgs_subtitle", lang: "jpn", title: "Japanese Full", forced: false },
+  ];
+  assert.equal(rankedTracks(tracks, ["eng"], { languageOrder: ["pt-br", "ja", "en"] })[0].ffIndex, 4);
+});
+
+test("does not require an explicit Full label to prefer the original language", () => {
+  const tracks = [
+    { ffIndex: 3, codec: "subrip", lang: "eng", title: "English Full", forced: false },
+    { ffIndex: 4, codec: "hdmv_pgs_subtitle", lang: "jpn", title: "Japanese", forced: false },
+  ];
+  assert.equal(rankedTracks(tracks, ["eng"], { languageOrder: ["pt-br", "ja", "en"] })[0].ffIndex, 4);
+});
+
+test("never sends an unsupported image-subtitle language to the English OCR engine", () => {
+  assert.equal(pgsOcrSupported({ lang: "eng" }), true);
+  assert.equal(pgsOcrSupported({ lang: "jpn" }), false);
+  assert.equal(pgsOcrSupported({ lang: "ara" }), false);
+});
+
+test("requests direct original-audio transcription before using an intermediate subtitle", async () => {
+  const mediaTracks = {
+    audioTracks: [{ ffIndex: 1, type: "audio", lang: "jpn", title: "Japanese Original", disposition: { original: 1 } }],
+    subtitleTracks: [{ ffIndex: 2, type: "subtitle", codec: "subrip", lang: "eng", title: "English Full", forced: false }],
+  };
+  await assert.rejects(
+    extractFileSubtitle("unused.mkv", ".", ["eng"], { mediaTracks, targetLocale: "pt-BR" }),
+    /transcrição direta do áudio/,
+  );
 });
 
 test("converts OCR SRT timestamps to WebVTT", () => {

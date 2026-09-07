@@ -1,5 +1,5 @@
 const fs = require("fs");
-const { spawnSync } = require("child_process");
+const { runProcess } = require("../utils/processRunner");
 
 function sampleOffsets(size, sampleBytes = 4096) {
   if (size <= sampleBytes) return [0];
@@ -17,18 +17,17 @@ function samplesAreAllZero(file, size, sampleBytes = 4096) {
   } finally { fs.closeSync(fd); }
 }
 
-function validateLocalMedia(file, { probe = true } = {}) {
+async function validateLocalMedia(file, { probe = true } = {}) {
   if (!file || !fs.existsSync(file)) return { valid: false, reason: "Arquivo local não existe" };
   const stat = fs.statSync(file);
   if (!stat.isFile() || stat.size < 1024 * 1024) return { valid: false, reason: "Arquivo local está vazio ou incompleto", size: stat.size };
   if (samplesAreAllZero(file, stat.size)) return { valid: false, reason: "Arquivo local contém somente bytes zerados", size: stat.size };
   if (!probe) return { valid: true, size: stat.size };
-  const result = spawnSync("ffprobe", ["-v", "error", "-show_entries", "format=format_name,duration", "-of", "json", file], {
-    encoding: "utf8",
-    timeout: 30000,
+  const result = await runProcess("ffprobe", ["-v", "error", "-show_entries", "format=format_name,duration", "-of", "json", file], {
+    timeoutMs: 30000,
     maxBuffer: 1024 * 1024,
   });
-  if (result.status !== 0) return { valid: false, reason: `FFprobe rejeitou o arquivo: ${(result.stderr || result.error?.message || "formato inválido").trim().slice(0, 1000)}`, size: stat.size };
+  if (result.status !== 0) return { valid: false, reason: `FFprobe rejeitou o arquivo: ${(result.stderr || "formato inválido").trim().slice(0, 1000)}`, size: stat.size };
   const probeErrors = String(result.stderr || "").trim();
   // ffprobe may still exit with status 0 after detecting damaged/truncated
   // Matroska structures. Accepting that output previously published a

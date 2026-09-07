@@ -1,29 +1,50 @@
-const { spawnSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const config = require("../config");
 const logger = require("../logger");
 const { sanitizeUrl } = require("../utils/security");
+const { runProcess } = require("../utils/processRunner");
 const { applyPgsPositionsToVtt } = require("./pgs");
+const { canonicalLanguage, languageMatches, subtitleLanguageOrder, translationRoute } = require("./languageStrategy");
 
-function runCmd(bin, args) {
-  return spawnSync(bin, args, { encoding: "utf8", maxBuffer: 8 * 1024 * 1024 });
+function runCmd(bin, args, options = {}) {
+  return runProcess(bin, args, { timeoutMs: config.mediaProcessTimeoutMs, maxBuffer: 8 * 1024 * 1024, ...options });
 }
 
-function probeSubtitles(sourceUrl) {
-  const res = runCmd("ffprobe", ["-v", "error", "-select_streams", "s", "-show_entries", "stream=index,codec_name:stream_tags=language,title:stream_disposition=forced", "-of", "json", sourceUrl]);
+async function probeMediaTracks(sourceUrl) {
+  const res = await runCmd("ffprobe", ["-v", "error", "-show_entries", "stream=index,codec_type,codec_name:stream_tags=language,title:stream_disposition", "-of", "json", sourceUrl], { timeoutMs: 30000 });
   if (res.status !== 0) throw new Error(`ffprobe falhou: ${res.stderr || res.stdout}`);
-  return (JSON.parse(res.stdout || "{}").streams || []).map((stream, index) => ({
+  const tracks = (JSON.parse(res.stdout || "{}").streams || []).map((stream, index) => ({
     ffIndex: stream.index ?? index,
-    lang: (stream.tags?.language || "").toLowerCase(),
+    type: stream.codec_type,
+    lang: canonicalLanguage(stream.tags?.language),
     title: stream.tags?.title || "",
     forced: Boolean(stream.disposition?.forced),
+    disposition: stream.disposition || {},
     codec: stream.codec_name,
   }));
+  return {
+    audioTracks: tracks.filter((track) => track.type === "audio"),
+    subtitleTracks: tracks.filter((track) => track.type === "subtitle"),
+  };
+}
+
+async function probeSubtitles(sourceUrl) {
+  return (await probeMediaTracks(sourceUrl)).subtitleTracks;
 }
 
 function languageRank(track, preferredLangs) {
-  const rank = preferredLangs.indexOf(track.lang);
+  const rank = preferredLangs.findIndex((language) => languageMatches(track.lang, language));
   return rank === -1 ? preferredLangs.length + 1 : rank;
+}
+
+function kindRank(track) {
+  const title = String(track.title || "").toLowerCase();
+  return track.forced || /songs?|signs?|forced|karaoke/.test(title) ? 1 : 0;
+}
+
+function pgsOcrSupported(track) {
+  return languageMatches(track.lang, "en");
 }
 
 function pickTextTrack(tracks, preferredLangs) {
@@ -34,31 +55,21 @@ function pickTextTrack(tracks, preferredLangs) {
 
 function pickPgsTrack(tracks, preferredLangs) {
   const pgs = tracks.filter((track) => String(track.codec || "").toLowerCase() === "hdmv_pgs_subtitle");
-  function kindRank(track) {
-    const title = String(track.title || "").toLowerCase();
-    if (/\bfull\b|complete|completa/.test(title)) return 0;
-    if (/songs?|signs?|forced/.test(title)) return 2;
-    return 1;
-  }
   return [...pgs].sort((a, b) => kindRank(a) - kindRank(b) || Number(a.forced) - Number(b.forced) || languageRank(a, preferredLangs) - languageRank(b, preferredLangs))[0] || null;
 }
 
-function rankedTracks(tracks, preferredLangs) {
+function rankedTracks(tracks, preferredLangs, options = {}) {
   const textCodecs = new Set(["subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text", "ttml"]);
-  const text = tracks.filter((track) => textCodecs.has(String(track.codec || "").toLowerCase()))
-    .sort((a, b) => Number(a.forced) - Number(b.forced) || languageRank(a, preferredLangs) - languageRank(b, preferredLangs));
-  const pgs = tracks.filter((track) => String(track.codec || "").toLowerCase() === "hdmv_pgs_subtitle");
-  const rankedPgs = [];
-  while (pgs.length) {
-    const selected = pickPgsTrack(pgs, preferredLangs);
-    rankedPgs.push(selected);
-    pgs.splice(pgs.indexOf(selected), 1);
-  }
-  return [...text, ...rankedPgs];
+  const usable = tracks.filter((track) => textCodecs.has(String(track.codec || "").toLowerCase()) || String(track.codec || "").toLowerCase() === "hdmv_pgs_subtitle");
+  const order = options.languageOrder || preferredLangs;
+  return [...usable].sort((a, b) => kindRank(a) - kindRank(b)
+    || languageRank(a, order) - languageRank(b, order)
+    || Number(!textCodecs.has(String(a.codec || "").toLowerCase())) - Number(!textCodecs.has(String(b.codec || "").toLowerCase()))
+    || Number(a.ffIndex) - Number(b.ffIndex));
 }
 
-function extractTrackToVtt(sourceUrl, trackIndex, outputPath) {
-  const res = runCmd("ffmpeg", ["-y", "-i", sourceUrl, "-map", `0:${trackIndex}`, "-c:s", "webvtt", "-f", "webvtt", outputPath]);
+async function extractTrackToVtt(sourceUrl, trackIndex, outputPath) {
+  const res = await runCmd("ffmpeg", ["-y", "-i", sourceUrl, "-map", `0:${trackIndex}`, "-c:s", "webvtt", "-f", "webvtt", outputPath]);
   if (res.status !== 0) throw new Error(`ffmpeg falhou: ${res.stderr || res.stdout}`);
   if (!fs.existsSync(outputPath)) throw new Error("Arquivo de legenda não gerado");
   return fs.readFileSync(outputPath, "utf8");
@@ -71,7 +82,7 @@ function srtToVtt(content) {
   return `WEBVTT\n\n${normalized.trim()}\n`;
 }
 
-function extractPgsToVtt(sourceUrl, trackIndex, outputDir) {
+async function extractPgsToVtt(sourceUrl, trackIndex, outputDir) {
   const supPath = path.join(outputDir, `track-${trackIndex}.sup`);
   const srtPath = path.join(outputDir, `track-${trackIndex}.srt`);
   const completePath = path.join(outputDir, `track-${trackIndex}.ocr-complete.json`);
@@ -90,9 +101,9 @@ function extractPgsToVtt(sourceUrl, trackIndex, outputDir) {
   }
   if (fs.existsSync(srtPath)) fs.unlinkSync(srtPath);
   if (fs.existsSync(completePath)) fs.unlinkSync(completePath);
-  const extraction = runCmd("ffmpeg", ["-y", "-v", "error", "-i", sourceUrl, "-map", `0:${trackIndex}`, "-c:s", "copy", supPath]);
+  const extraction = await runCmd("ffmpeg", ["-y", "-v", "error", "-i", sourceUrl, "-map", `0:${trackIndex}`, "-c:s", "copy", supPath]);
   if (extraction.status !== 0 || !fs.existsSync(supPath)) throw new Error(`Falha ao extrair legenda PGS: ${extraction.stderr || extraction.stdout}`);
-  const ocr = runCmd("suptext", [supPath]);
+  const ocr = await runCmd("suptext", [supPath]);
   if (ocr.status !== 0 || !fs.existsSync(srtPath)) throw new Error(`OCR da legenda PGS falhou: ${ocr.stderr || ocr.stdout}`);
   const vtt = srtToVtt(fs.readFileSync(srtPath, "utf8"));
   const cueCount = (vtt.match(/-->/g) || []).length;
@@ -101,12 +112,20 @@ function extractPgsToVtt(sourceUrl, trackIndex, outputDir) {
   return applyPgsPositionsToVtt(vtt, supPath);
 }
 
-async function extractFileSubtitle(sourceUrl, outputDir, preferredLangs, { excludedTrackIndexes = [] } = {}) {
+async function extractFileSubtitle(sourceUrl, outputDir, preferredLangs, { excludedTrackIndexes = [], mediaTracks = null, source = {}, targetLocale = "pt-BR", allowIntermediateFallback = false } = {}) {
   logger.info("Extraindo legenda embutida", { source: sanitizeUrl(sourceUrl) });
-  const tracks = probeSubtitles(sourceUrl);
+  const probed = mediaTracks || await probeMediaTracks(sourceUrl);
+  const tracks = probed.subtitleTracks;
   if (!tracks.length) throw new Error("Nenhuma trilha de legenda no arquivo");
   const excluded = new Set(excludedTrackIndexes.map(Number));
-  const candidates = rankedTracks(tracks, preferredLangs).filter((track) => !excluded.has(Number(track.ffIndex)));
+  const strategy = subtitleLanguageOrder({ source, audioTracks: probed.audioTracks, preferredLangs, targetLocale });
+  const ranked = rankedTracks(tracks, preferredLangs, { languageOrder: strategy.languages }).filter((track) => !excluded.has(Number(track.ffIndex)));
+  const candidates = ranked.filter((track) => String(track.codec || "").toLowerCase() !== "hdmv_pgs_subtitle" || pgsOcrSupported(track));
+  const fullTargetAvailable = candidates.some((track) => kindRank(track) === 0 && languageMatches(track.lang, targetLocale));
+  const fullOriginalAvailable = candidates.some((track) => kindRank(track) === 0 && languageMatches(track.lang, strategy.originalAudio?.lang));
+  if (!allowIntermediateFallback && !fullTargetAvailable && strategy.originalAudio && strategy.originalAudio.lang !== "und" && !fullOriginalAvailable) {
+    throw new Error(`Nenhuma legenda completa e segura no idioma original (${strategy.originalAudio.lang}); transcrição direta do áudio será usada antes de qualquer idioma intermediário`);
+  }
   if (!candidates.length) throw new Error("Nenhuma trilha de legenda textual ou PGS utilizável no arquivo");
   const errors = [];
   for (const track of candidates) {
@@ -114,9 +133,19 @@ async function extractFileSubtitle(sourceUrl, outputDir, preferredLangs, { exclu
       const pgs = String(track.codec || "").toLowerCase() === "hdmv_pgs_subtitle";
       if (pgs) logger.info("Convertendo legenda PGS embutida com OCR", { trackIndex: track.ffIndex, language: track.lang, title: track.title });
       const content = pgs
-        ? extractPgsToVtt(sourceUrl, track.ffIndex, outputDir)
-        : extractTrackToVtt(sourceUrl, track.ffIndex, path.join(outputDir, `track-${track.ffIndex}.vtt`));
-      return { lang: track.lang || "und", name: pgs ? `ocr-pgs-track-${track.ffIndex}` : `track-${track.ffIndex}`, trackIndex: track.ffIndex, content };
+        ? await extractPgsToVtt(sourceUrl, track.ffIndex, outputDir)
+        : await extractTrackToVtt(sourceUrl, track.ffIndex, path.join(outputDir, `track-${track.ffIndex}.vtt`));
+      return {
+        lang: track.lang || "und",
+        name: pgs ? `ocr-pgs-track-${track.ffIndex}` : `track-${track.ffIndex}`,
+        trackIndex: track.ffIndex,
+        content,
+        sourceAudioIndex: strategy.originalAudio?.ffIndex ?? null,
+        sourceAudioLanguage: strategy.originalAudio?.lang || "und",
+        sourceAudioReason: strategy.originalAudio?.reason || "unavailable",
+        sourceAudioConfidence: strategy.originalAudio?.confidence || "unknown",
+        translationRoute: translationRoute(track.lang, strategy.originalAudio),
+      };
     } catch (error) {
       errors.push(`track ${track.ffIndex}: ${error.message}`);
       logger.warn("Falha ao extrair trilha; tentando a próxima", { trackIndex: track.ffIndex, error: error.message });
@@ -125,4 +154,4 @@ async function extractFileSubtitle(sourceUrl, outputDir, preferredLangs, { exclu
   throw new Error(`Nenhuma trilha embutida pôde ser extraída: ${errors.join(" | ")}`);
 }
 
-module.exports = { probeSubtitles, pickTextTrack, pickPgsTrack, rankedTracks, srtToVtt, extractFileSubtitle };
+module.exports = { probeMediaTracks, probeSubtitles, pickTextTrack, pickPgsTrack, pgsOcrSupported, rankedTracks, srtToVtt, extractFileSubtitle };

@@ -526,6 +526,21 @@ O sistema deverá registrar métricas úteis sem expor segredos:
 
 Logs deverão usar IDs internos e nomes sanitizados. A URL completa de uma fonte nunca deverá aparecer em logs normais.
 
+### Garantias implementadas no gateway atual
+
+- Escritas de catálogos e metadados são atômicas, serializadas por arquivo e mantêm uma cópia de recuperação; corrupção irrecuperável interrompe a operação em vez de substituir silenciosamente os dados.
+- Downloads e artefatos MKV/HLS usam reservas distribuídas no Redis antes de ocupar espaço, com renovação e liberação automática.
+- A concorrência de conversões HLS é coordenada no Redis entre processos, não apenas na memória de uma instância.
+- Processos de FFmpeg, FFprobe e OCR são assíncronos e possuem prazo máximo, preservando a capacidade do worker de renovar locks e atender outros eventos.
+- Requisições internas possuem timeout durante cabeçalhos e corpo. Recursos remotos são limitados por tamanho e protocolo, e o endereço IP validado contra SSRF é fixado na conexão para impedir troca de DNS.
+- O áudio padrão HLS é codificado somente junto ao vídeo; playlists separadas são produzidas apenas para faixas alternativas.
+- O gerenciador mede o armazenamento sem varreduras recursivas repetidas e deduplica arquivos físicos compartilhados por mais de um episódio.
+- OCR PGS preserva a saída bruta para auditoria e saneia artefatos inequívocos antes da tradução. O tradutor usa cenas com contexto vizinho, separa trechos em japonês romanizado e exige uma revisão bilíngue do rascunho.
+- A publicação rejeita omissões, IDs deslocados, resíduos de OCR, alteração de valores numéricos e inconsistência de nomes próprios recorrentes; falhas semânticas objetivas acionam uma nova revisão.
+- Áudio e legenda são selecionados como um par linguístico em arquivos locais, HLS e DASH. Legenda PT-BR completa tem prioridade; em seguida vêm legenda no idioma original e transcrição direta da faixa original. Um idioma intermediário é fallback auditável, nunca tratado como fonte original.
+- A faixa de áudio escolhida é reutilizada por índice na transcrição e no alinhamento. Após divisão e formatação, todas as falas são reconstruídas e comparadas com a tradução aprovada; perda, repetição ou deslocamento de texto bloqueia a publicação. Cada cartão final aceita no máximo duas linhas de 42 caracteres.
+- Lint, testes com cobertura, auditoria de dependências, validação do Compose e sintaxe Python são executados pela integração contínua.
+
 ## 12. Problemas conhecidos no esqueleto atual
 
 Antes de reutilizar o código existente, os seguintes problemas precisam ser resolvidos:

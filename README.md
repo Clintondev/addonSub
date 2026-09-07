@@ -47,7 +47,7 @@ O episódio escolhido usa prioridade alta. Os episódios antecipados usam priori
 
 O rótulo `Vídeo pronto · PT-BR em preparação` significa que a mídia já pode ser reproduzida, mas a legenda ainda não deve aparecer no seletor. Abrir esse resultado coloca automaticamente a legenda na fila. Uma legenda só é reutilizada entre duas entradas quando ambas apontam para o mesmo arquivo físico, garantindo a mesma linha do tempo.
 
-Os vídeos originais ficam em `storage/media`. Os MKVs preparados para reprodução local ficam em `storage/playback`; eles não alteram o arquivo original, mas ocupam aproximadamente mais uma cópia da mídia enquanto estiverem em uso. O limite padrão de armazenamento é 100 GB e pode ser alterado com `MAX_STORAGE_GB` no `.env`.
+Os vídeos originais ficam em `storage/media`. Os MKVs preparados para reprodução local ficam em `storage/playback`; eles não alteram o arquivo original, mas ocupam aproximadamente mais uma cópia da mídia enquanto estiverem em uso. O limite padrão de armazenamento é 100 GB e pode ser alterado com `MAX_STORAGE_GB` no `.env`. Downloads, MKVs e HLS reservam espaço antes de começar, inclusive quando existem workers concorrentes, evitando ultrapassar a cota por trabalhos simultâneos.
 
 ## Acompanhar o progresso
 
@@ -122,9 +122,12 @@ docker compose up -d --build
 As principais opções estão em `.env.example`:
 
 - `UPSTREAM_ADDONS`: add-ons consultados para obter streams.
-- `MAX_STORAGE_GB`: limite de espaço reservado aos downloads.
+- `MAX_STORAGE_GB`: cota global de downloads e artefatos de reprodução.
+- `STORAGE_RESERVATION_LEASE_SECONDS`: validade renovável das reservas de espaço compartilhadas entre workers.
 - `TORRENT_METADATA_TIMEOUT_SECONDS`: tempo máximo para obter os metadados do torrent.
 - `TORRENT_DOWNLOAD_TIMEOUT_MINUTES`: tempo máximo de uma preparação.
+- `INTERNAL_HTTP_TIMEOUT_SECONDS`: limite das chamadas aos serviços internos.
+- `TRANSCRIPTION_TIMEOUT_MINUTES` e `MEDIA_PROCESS_TIMEOUT_MINUTES`: limites de transcrição e FFmpeg/OCR.
 - `SUBTITLE_TOKEN_SECRET` e `ADMIN_TOKEN`: segredos locais; gere valores diferentes e não os publique.
 - `ALLOWED_CLIENT_IPS`: IPs públicos ou redes CIDR autorizados; vazio desativa a restrição.
 - `BASE_URL`: use `http://localhost:7000` quando o Stremio estiver no mesmo computador.
@@ -145,12 +148,25 @@ O qBittorrent WebUI não é publicado para o Windows: ele fica acessível apenas
 - Worker BullMQ para download, extração, transcrição e tradução.
 - qBittorrent-nox para armazenamento local.
 - Redis para fila e estado.
-- Ollama com Google TranslateGemma 12B para tradução especializada em PT-BR. As falas são enviadas em blocos contextuais com identificadores imutáveis, e qualquer omissão ou alteração estrutural rejeita o resultado antes da publicação.
+- Ollama com Google TranslateGemma 12B para tradução especializada em PT-BR. As falas são enviadas em cenas contextuais (até 24 falas), com contexto vizinho e identificadores imutáveis. Uma segunda passagem bilíngue obrigatória confronta original e rascunho; omissões, resíduos de OCR, mudanças de números e de nomes protegidos rejeitam o resultado e acionam nova revisão antes da publicação.
 - LibreTranslate faz a detecção de idioma; seu fallback de tradução literal vem desativado para impedir publicação silenciosa de uma tradução inferior.
 - Tesseract/Suptext, com dados de inglês e português, para OCR de legendas PGS embutidas.
 - faster-whisper `large-v3` na GPU para transcrição de último recurso.
 - FFmpeg com NVENC para HLS H.264/AAC compatível com navegadores, com fallback para CPU.
 
-O worker só publica uma legenda depois de validar quantidade de falas, IDs, marcações de tempo, sobreposições e durações anormais. Resultados parciais de OCR possuem marcador atômico de conclusão e nunca são reutilizados como se estivessem completos.
+O worker só publica uma legenda depois de validar quantidade de falas, IDs, marcações de tempo, sobreposições, durações anormais e fidelidade objetiva. Ele forma um par entre áudio original e legenda do mesmo idioma para arquivos locais, HLS e DASH. A prioridade é: legenda completa em PT-BR, legenda completa no idioma original, transcrição direta do áudio original e, somente quando isso não é possível, idioma intermediário. A rota, o idioma do áudio e o grau de confiança da identificação ficam registrados no gerenciador.
+
+Fontes PGS preservam `original-raw.vtt` para auditoria e usam um `original.vtt` saneado para tradução. Como o OCR PGS atual reconhece inglês com segurança, uma PGS em outro idioma não é enviada ao OCR inglês: o sistema prefere transcrever o áudio original. Trechos de música em japonês romanizado são separados do diálogo principal e recebem instrução de idioma própria. Resultados parciais de OCR possuem marcador atômico de conclusão e nunca são reutilizados como se estivessem completos.
+
+Depois da tradução e do alinhamento, o texto é remontado por fala e comparado integralmente com a saída do tradutor. Qualquer palavra perdida, repetida ou movida entre falas impede a publicação. A saída final também é limitada a duas linhas visuais de até 42 caracteres, mantendo a ordem e as janelas temporais da fonte.
+
+## Qualidade e verificação
+
+```powershell
+npm run check
+npm run test:coverage
+```
+
+O primeiro comando executa análise estática, testes e auditoria das dependências de produção. O segundo exige no mínimo 60% de linhas, 70% de desvios e 65% de funções cobertas. A automação do repositório repete essas verificações em Node.js 20 e 22, valida a configuração Docker Compose e verifica a sintaxe dos serviços Python.
 
 Consulte [PROJECT_DOCUMENTATION.md](./PROJECT_DOCUMENTATION.md) para o histórico e os requisitos conceituais. Quando houver divergência, este README e o código atual são as fontes operacionais.

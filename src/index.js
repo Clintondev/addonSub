@@ -7,7 +7,7 @@ const { getMetricsText } = require("./metrics");
 const { aggregateStreams } = require("./services/upstreams");
 const sourceStore = require("./services/sourceStore");
 const { ensureSrtSubtitle, queueTranslationJob, savePendingSubtitle, subtitlePath } = require("./services/subtitleService");
-const { readMeta, transition } = require("./services/metadata");
+const { readMeta, transition, transitionIf } = require("./services/metadata");
 const { verifyPath } = require("./utils/security");
 const { getQueue } = require("./jobs/queue");
 const { ensureHls, outputPath: hlsOutputPath, pruneHlsCache, scheduleHlsCachePruning } = require("./services/hlsPlayback");
@@ -22,6 +22,7 @@ const { healthReport } = require("./services/health");
 const { parseVtt, serializeVtt } = require("./services/vtt");
 const { associatedTranslationStatus, subtitleOwner } = require("./services/subtitleAssociation");
 const { ensureEmbeddedPlayback } = require("./services/embeddedPlayback");
+const { getStorageUsage } = require("./services/storageUsage");
 
 function buildManifest() {
   return {
@@ -254,8 +255,10 @@ async function prepareEpisodeSelection({ type, videoId, sourceId = null }) {
   const record = sourceStore.upsert(current.localPath ? current : { ...current, acquisitionState: "queued" });
   if (manager.episodeView(record).subtitle.status !== "ready") {
     await savePendingSubtitle(record.sourceId);
-    transition(record.sourceId, "queued", { progress: 0, downloadProgress: record.localPath ? 100 : 0, error: null });
-    await queueTranslationJob(record.sourceId, 1);
+    const job = await queueTranslationJob(record.sourceId, 1);
+    const processingStages = new Set(["acquiring", "recovering", "probing", "transcribing", "synchronizing", "contextualizing", "aligning", "translating", "validating", "packaging"]);
+    transitionIf(record.sourceId, "queued", { progress: 0, downloadProgress: record.localPath ? 100 : 0, error: null }, (currentMeta) => !processingStages.has(currentMeta.stage));
+    return manager.episodeView(sourceStore.get(record.sourceId), { jobId: job.id });
   }
   return manager.episodeView(sourceStore.get(record.sourceId));
 }
@@ -569,10 +572,11 @@ function createApp() {
         if (!meta.name || !videos.length) fetchSeriesMetadata(show.imdbId).catch((error) => logger.warn("Series catalog refresh failed", { imdbId: show.imdbId, error: error.message }));
       }
       const logs = [...manager.stateErrorLogs(allSources), ...logger.readLogs({ limit: 100 })].sort((a, b) => String(b.at).localeCompare(String(a.at)));
+      const usedBytes = await getStorageUsage();
       res.json({
         generatedAt: new Date().toISOString(),
         shows,
-        storage: manager.storageView(shows, allSources.length),
+        storage: manager.storageView(shows, allSources.length, usedBytes),
         recentErrors: logs.filter((entry) => ["warn", "error"].includes(entry.level)).slice(0, 12),
         settings: { defaultPrefetchAhead: 0, maxPrefetchAhead: 12, targetLocale: config.targetLocale },
       });
@@ -615,17 +619,43 @@ function createApp() {
       if (!sourceStore.get(req.params.sourceId)) return res.status(404).json({ error: "Source not found" });
       const existing = await getQueue().getJob(req.params.sourceId);
       if (existing && (await existing.getState()) === "active") return res.status(409).json({ error: "A legenda já está sendo processada; aguarde a execução atual" });
-      for (const fileName of ["pt-BR.vtt", "pt-BR.ass", "original.vtt", "transcribed.vtt", "processing-audio.flac", "alignment-en-words.json", "alignment-audio-en.flac", "layout-complete.json", "failed.json", "validation-debug.vtt"]) {
+      for (const fileName of ["pt-BR.vtt", "pt-BR.ass", "original.vtt", "original-raw.vtt", "transcribed.vtt", "processing-audio.flac", "alignment-en-words.json", "alignment-audio-en.flac", "layout-complete.json", "failed.json", "validation-debug.vtt"]) {
         const file = subtitlePath(req.params.sourceId, fileName);
         if (fs.existsSync(file)) fs.rmSync(file, { force: true });
       }
+      transition(req.params.sourceId, "queued", {
+        progress: 0,
+        cues: null,
+        translated: null,
+        from: null,
+        to: null,
+        provider: null,
+        translationProvider: null,
+        languageDeclared: null,
+        languageDetected: null,
+        translationSourceLanguage: null,
+        translationRoute: null,
+        sourceAudioLanguage: null,
+        sourceAudioConfidence: null,
+        sourceMethod: null,
+        origin: null,
+        trackIndex: null,
+        alignment: null,
+        alignmentQuality: null,
+        sourceQuality: null,
+        finalQuality: null,
+        outputs: null,
+        error: null,
+        extractionError: null,
+        transcriptionFallbackReason: null,
+      });
       const job = await queueTranslationJob(req.params.sourceId, 1);
       res.status(202).json({ jobId: job.id });
     } catch (error) { next(error); }
   });
 
   app.get("/api/sources/:sourceId/subtitles/:kind", (req, res) => {
-    const names = { original: "original.vtt", final: "pt-BR.vtt" };
+    const names = { raw: "original-raw.vtt", original: "original.vtt", final: "pt-BR.vtt" };
     const fileName = names[req.params.kind];
     if (!fileName) return res.status(404).json({ error: "Artifact not found" });
     let file;

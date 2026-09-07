@@ -2,11 +2,12 @@ const { XMLParser } = require("fast-xml-parser");
 const logger = require("../logger");
 const { sanitizeUrl } = require("../utils/security");
 const { safeRemoteFetch, safeRemoteText } = require("./safeRemoteFetch");
+const { canonicalLanguage, languageMatches, subtitleLanguageOrder, translationRoute } = require("./languageStrategy");
 
 function resolveUrl(base, ref) {
   try {
     return new URL(ref, base).toString();
-  } catch (err) {
+  } catch (_err) {
     return ref;
   }
 }
@@ -26,7 +27,7 @@ function listSubtitleReps(manifest, baseUrl) {
   arr.forEach((adp) => {
     const type = adp["@_contentType"] || adp["@_mimeType"] || "";
     const mime = (adp["@_mimeType"] || "").toLowerCase();
-    const lang = (adp["@_lang"] || "").toLowerCase();
+    const lang = canonicalLanguage(adp["@_lang"]);
     if (
       type === "text" ||
       mime.includes("vtt") ||
@@ -36,7 +37,7 @@ function listSubtitleReps(manifest, baseUrl) {
       const reps = adp.Representation || [];
       const repsArr = Array.isArray(reps) ? reps : [reps];
       repsArr.forEach((rep) => {
-        const repLang = (rep["@_lang"] || lang || "").toLowerCase();
+        const repLang = canonicalLanguage(rep["@_lang"] || lang);
         const repMime = (rep["@_mimeType"] || mime || "").toLowerCase();
         let url = null;
         if (rep.BaseURL) {
@@ -57,10 +58,28 @@ function listSubtitleReps(manifest, baseUrl) {
   return lists.filter((l) => l.url);
 }
 
+function listAudioTracks(manifest) {
+  const adaptations = manifest?.MPD?.Period?.AdaptationSet || manifest?.MPD?.Period?.[0]?.AdaptationSet || [];
+  const list = Array.isArray(adaptations) ? adaptations : [adaptations];
+  return list.filter((adaptation) => String(adaptation?.["@_contentType"] || adaptation?.["@_mimeType"] || "").toLowerCase().includes("audio"))
+    .map((adaptation, index) => {
+      const title = adaptation["@_label"] || "";
+      return {
+        ffIndex: index,
+        lang: canonicalLanguage(adaptation["@_lang"]),
+        title,
+        disposition: {
+          original: /\boriginal\b|\bnative\b|idioma original/i.test(title),
+          dub: /\bdub(?:bed)?\b|dublado/i.test(title),
+        },
+      };
+    });
+}
+
 function pickTrack(tracks, preferredLangs) {
   if (!tracks.length) return null;
   for (const pref of preferredLangs) {
-    const found = tracks.find((t) => t.lang === pref);
+    const found = tracks.find((t) => languageMatches(t.lang, pref));
     if (found) return found;
   }
   return tracks[0];
@@ -75,10 +94,12 @@ async function extractDashSubtitle(mpdUrl, options = {}) {
   });
   const manifest = parser.parse(xmlText);
   const tracks = listSubtitleReps(manifest, mpdUrl);
+  const audioTracks = listAudioTracks(manifest);
   if (!tracks.length) {
     throw new Error("Nenhuma legenda encontrada no MPD");
   }
-  const track = pickTrack(tracks, preferredLangs);
+  const strategy = subtitleLanguageOrder({ source: options.source, audioTracks, preferredLangs, targetLocale: options.targetLocale });
+  const track = pickTrack(tracks, strategy.languages);
   logger.info("Selecionada trilha DASH", {
     lang: track.lang,
     mime: track.mime,
@@ -91,9 +112,17 @@ async function extractDashSubtitle(mpdUrl, options = {}) {
     lang: track.lang || "und",
     name: track.mime || "dash-sub",
     content,
+    sourceAudioIndex: null,
+    sourceAudioLanguage: strategy.originalAudio?.lang || "und",
+    sourceAudioReason: strategy.originalAudio?.reason || "unavailable",
+    sourceAudioConfidence: strategy.originalAudio?.confidence || "unknown",
+    translationRoute: translationRoute(track.lang, strategy.originalAudio),
   };
 }
 
 module.exports = {
   extractDashSubtitle,
+  listAudioTracks,
+  listSubtitleReps,
+  pickTrack,
 };

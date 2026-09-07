@@ -9,7 +9,7 @@ const { parseVideoId } = require("./videoId");
 const { aggregateStreams, normalizeStream } = require("./upstreams");
 const { getFiles } = require("./qbittorrent");
 const { queueTranslationJob, savePendingSubtitle, translationStatus } = require("./subtitleService");
-const { transition } = require("./metadata");
+const { transitionIf } = require("./metadata");
 const { safeChildPath } = require("../utils/security");
 
 const VIDEO_EXTENSIONS = new Set([".mkv", ".mp4", ".avi", ".mov", ".m4v", ".webm", ".ts", ".m2ts"]);
@@ -128,7 +128,7 @@ async function fetchSeriesMetadata(imdbId) {
     if (!videos.length) throw new Error("Cinemeta returned no episodes");
     fs.mkdirSync(path.dirname(file), { recursive: true });
     const temporary = `${file}.tmp`;
-    fs.writeFileSync(temporary, JSON.stringify({ fetchedAt: Date.now(), meta: { name: meta.name, poster: meta.poster, background: meta.background, year: meta.year }, videos }), "utf8");
+    fs.writeFileSync(temporary, JSON.stringify({ fetchedAt: Date.now(), meta: { name: meta.name, poster: meta.poster, background: meta.background, year: meta.year, country: meta.country, originalLanguage: meta.originalLanguage || meta.original_language || null }, videos }), "utf8");
     fs.renameSync(temporary, file);
     return { meta, videos };
   } finally { clearTimeout(timer); }
@@ -159,11 +159,12 @@ async function discoverPrefetchSource(selected, videoId, torrentFiles) {
 
 async function runPrefetch(selected, aheadOverride) {
   const current = parseVideoId("series", selected.videoId);
+  const configured = watchStore.get(current.imdbId)?.prefetchAhead;
+  const ahead = Number.isInteger(aheadOverride) ? aheadOverride : Number.isInteger(configured) ? configured : config.prefetch.ahead;
+  if (ahead <= 0) return [];
   let videos = [];
   try { videos = await fetchSeriesVideos(current.imdbId); }
   catch (error) { logger.warn("Series metadata unavailable; using same-season sequence", { imdbId: current.imdbId, error: error.message }); }
-  const configured = watchStore.get(current.imdbId)?.prefetchAhead;
-  const ahead = Number.isInteger(aheadOverride) ? aheadOverride : Number.isInteger(configured) ? configured : config.prefetch.ahead;
   const nextIds = nextEpisodeIds(videos, selected.videoId, ahead);
   let torrentFiles = [];
   if (selected.infoHash) {
@@ -184,8 +185,9 @@ async function runPrefetch(selected, aheadOverride) {
       });
       if (translationStatus(record.sourceId).status !== "ready") {
         await savePendingSubtitle(record.sourceId);
-        transition(record.sourceId, "prefetch-queued", { parentSourceId: selected.sourceId, position: index + 1, videoId });
         await queueTranslationJob(record.sourceId, config.prefetch.priority);
+        const processingStages = new Set(["acquiring", "recovering", "probing", "transcribing", "synchronizing", "contextualizing", "aligning", "translating", "validating", "packaging"]);
+        transitionIf(record.sourceId, "prefetch-queued", { parentSourceId: selected.sourceId, position: index + 1, videoId }, (currentMeta) => !processingStages.has(currentMeta.stage));
       }
       queued.push({ sourceId: record.sourceId, videoId, sameTorrent: record.infoHash === selected.infoHash });
     } catch (error) {

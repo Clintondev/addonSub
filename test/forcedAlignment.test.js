@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { buildForcedAlignedCues, matchedAudioRange, phraseChunks, reconstructTranslations } = require("../src/services/forcedAlignment");
+const { assertTranslationsPreserved, buildForcedAlignedCues, matchedAudioRange, phraseChunks, reconstructTranslations } = require("../src/services/forcedAlignment");
 
 test("splits only at semantic sentence boundaries without losing text", () => {
   const text = "Estou ansiosa para preparar tudo para a apreciação das flores de amanhã! Vai ser incrível.";
@@ -95,4 +95,6 @@ test("reconstructs the original translations from split display cues without dup
     { time: "00:00:04.000 --> 00:00:06.000", text: "Segunda frase." },
   ];
   assert.deepEqual(reconstructTranslations(source, display), ["Primeira frase.", "Segunda frase."]);
+  assert.doesNotThrow(() => assertTranslationsPreserved(source, ["Primeira frase.", "Segunda frase."], display));
+  assert.throws(() => assertTranslationsPreserved(source, ["Primeira diferente.", "Segunda frase."], display), /alterou o conteúdo/);
 });

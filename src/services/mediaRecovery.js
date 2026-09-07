@@ -39,7 +39,7 @@ function removeRecoveryArtifacts(sourceId, mediaPath) {
   }
   fs.rmSync(safeChildPath(config.hlsDir, sourceId), { recursive: true, force: true });
   const subtitlesDir = safeChildPath(config.storageDir, "subtitles", sourceId);
-  for (const fileName of ["pt-BR.vtt", "pt-BR.srt", "pt-BR.ass", "original.vtt", "pending.vtt", "failed.json", "processing-audio.flac", "transcribed.vtt", "layout-complete.json", "validation-debug.vtt", "alignment-en-words.json", "alignment-audio-en.flac"]) {
+  for (const fileName of ["pt-BR.vtt", "pt-BR.srt", "pt-BR.ass", "original.vtt", "original-raw.vtt", "pending.vtt", "failed.json", "processing-audio.flac", "transcribed.vtt", "layout-complete.json", "validation-debug.vtt", "alignment-en-words.json", "alignment-audio-en.flac"]) {
     fs.rmSync(path.join(subtitlesDir, fileName), { force: true });
   }
   try {
@@ -85,7 +85,7 @@ async function recoverCorruptMedia(source, validation, onProgress = async () => 
     try {
       if (candidate.recheck) await forceRecheck(record.infoHash, config.mediaRecoveryRecheckTimeoutMs);
       const acquired = await acquireTorrent(record, onProgress);
-      const checked = validateLocalMedia(acquired.localPath);
+      const checked = await validateLocalMedia(acquired.localPath);
       if (!checked.valid) {
         removeRecoveryArtifacts(source.sourceId, acquired.localPath);
         throw new Error(checked.reason);

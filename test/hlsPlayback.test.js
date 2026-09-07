@@ -2,7 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const config = require("../src/config");
 const { buildFfmpegArgs, choosePlan } = require("../src/services/hlsPlayback");
-const { addHlsTimestampMap, buildHlsMasterPlaylist, buildHlsSubtitlePlaylist, buildHlsSubtitleSegment, externalSubtitleView, streamView, streamViews, subtitleRequestSelector } = require("../src/index");
+const { buildHlsMasterPlaylist, buildHlsSubtitlePlaylist, buildHlsSubtitleSegment, externalSubtitleView, streamView, streamViews, subtitleRequestSelector } = require("../src/index");
 const { vttToSrt } = require("../src/services/subtitleService");
 
 function probe(videoCodec, audioCodec = "aac", channels = 2) {
@@ -29,7 +29,7 @@ test("copies browser-compatible H.264 but rebuilds the AAC timeline", () => {
       language: "eng",
       title: "English",
       isDefault: true,
-      playlist: "audio-0.m3u8",
+      playlist: null,
     }],
   });
 });
@@ -58,24 +58,24 @@ test("uses NVENC and converts incompatible audio for HEVC sources", () => {
   assert.ok(args.includes("0:1"));
 });
 
-test("burns PT-BR into browser video while preserving HLS audio renditions", () => {
+test("burns PT-BR into browser video without duplicating the in-band default audio", () => {
   const plan = choosePlan(probe("hevc", "truehd", 6), true);
   plan.subtitleBurnedIn = true;
   const args = buildFfmpegArgs("episode.mkv", "cache/video.m3u8", plan, config.hls, "/storage/subtitles/src_test/pt-BR.ass");
   const filter = args[args.indexOf("-vf") + 1];
   assert.match(filter, /subtitles=filename='\/storage\/subtitles\/src_test\/pt-BR\.ass'/);
   assert.ok(args.includes("aac"));
-  assert.ok(args.some((argument) => argument.endsWith("audio-0.m3u8")));
+  assert.ok(!args.some((argument) => argument.endsWith("audio-0.m3u8")));
 });
 
-test("muxes the default audio with video and generates explicit playlists for every language", () => {
+test("muxes the default audio with video and generates playlists only for alternate languages", () => {
   const media = probe("hevc", "truehd", 6);
   media.streams.push({ index: 2, codec_type: "audio", codec_name: "truehd", channels: 2, tags: { language: "jpn", title: "Japanese" } });
   const plan = choosePlan(media, true);
   const args = buildFfmpegArgs("episode.mkv", "cache/video.m3u8", plan, config.hls);
-  assert.equal(plan.audioTracks[0].playlist, "audio-0.m3u8");
+  assert.equal(plan.audioTracks[0].playlist, null);
   assert.equal(plan.audioTracks[1].playlist, "audio-1.m3u8");
-  assert.ok(args.some((argument) => argument.endsWith("audio-0.m3u8")));
+  assert.ok(!args.some((argument) => argument.endsWith("audio-0.m3u8")));
   assert.ok(args.some((argument) => argument.endsWith("audio-1.m3u8")));
   assert.ok(args.includes("0:1"));
   assert.ok(args.includes("0:2"));

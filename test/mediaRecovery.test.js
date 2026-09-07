@@ -6,15 +6,15 @@ const path = require("path");
 const { validateLocalMedia } = require("../src/services/mediaValidation");
 const { currentRecoveryCandidate, recoveryCandidates, seedCount } = require("../src/services/mediaRecovery");
 
-test("rejects a correctly sized media file containing only zero bytes", () => {
+test("rejects a correctly sized media file containing only zero bytes", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "media-validation-"));
   const file = path.join(dir, "episode.mkv");
   fs.writeFileSync(file, Buffer.alloc(2 * 1024 * 1024));
-  assert.match(validateLocalMedia(file, { probe: false }).reason, /bytes zerados/);
+  assert.match((await validateLocalMedia(file, { probe: false })).reason, /bytes zerados/);
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test("accepts sampled nonzero data before the FFprobe stage", () => {
+test("accepts sampled nonzero data before the FFprobe stage", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "media-validation-"));
   const file = path.join(dir, "episode.mkv");
   const content = Buffer.alloc(2 * 1024 * 1024);
@@ -22,7 +22,7 @@ test("accepts sampled nonzero data before the FFprobe stage", () => {
   content[Math.floor(content.length / 2)] = 0x45;
   content[content.length - 1] = 0xdf;
   fs.writeFileSync(file, content);
-  assert.equal(validateLocalMedia(file, { probe: false }).valid, true);
+  assert.equal((await validateLocalMedia(file, { probe: false })).valid, true);
   fs.rmSync(dir, { recursive: true, force: true });
 });
 

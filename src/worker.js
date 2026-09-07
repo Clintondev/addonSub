@@ -8,12 +8,12 @@ const sourceStore = require("./services/sourceStore");
 const { subtitlePath, ensureSourceDir, ensureSrtSubtitle } = require("./services/subtitleService");
 const { extractHlsSubtitle } = require("./services/hls");
 const { extractDashSubtitle } = require("./services/dash");
-const { extractFileSubtitle } = require("./services/ffextract");
+const { extractFileSubtitle, probeMediaTracks } = require("./services/ffextract");
 const { releaseTranscriptionModel, transcribeSource } = require("./services/transcribe");
 const { parseVtt, serializeVtt } = require("./services/vtt");
-const { detectLanguage, translateBatch, translateContextual, unloadContextualModel, mapTargetLocale } = require("./services/translate");
-const { assertCueIntegrity, assertSubtitleCompleteness, mergeShortCues, finalizeCues, parseTimestamp, preserveDialogueLayout, removeEmptyCues } = require("./services/subtitleQuality");
-const { buildForcedAlignedCues, fetchWordTimestamps } = require("./services/forcedAlignment");
+const { detectLanguage, inferProtectedTerms, translateBatch, translateContextual, unloadContextualModel, mapTargetLocale, looksRomanizedJapanese, normalizeOcrSourceText } = require("./services/translate");
+const { assertCueIntegrity, assertSubtitleCompleteness, displayChunks, mergeShortCues, finalizeCues, localizeBrazilianPortuguese, parseTimestamp, preserveDialogueLayout, removeEmptyCues } = require("./services/subtitleQuality");
+const { assertTranslationsPreserved, buildForcedAlignedCues, fetchWordTimestamps } = require("./services/forcedAlignment");
 const { readMeta, transition } = require("./services/metadata");
 const { inc } = require("./metrics");
 const { assertSafeRemoteUrl, stableHash, safeChildPath } = require("./utils/security");
@@ -24,6 +24,9 @@ const { isCancelled } = require("./services/cancellationStore");
 const { withGpuLock } = require("./services/gpuLock");
 const { scheduleSeriesPrefetch } = require("./services/seriesPrefetch");
 const { ensureEmbeddedPlayback } = require("./services/embeddedPlayback");
+const { downloadRemoteMedia } = require("./services/remoteMedia");
+const { canonicalLanguage, languageMatches, selectOriginalAudio, speechRecognitionLanguage, translationRoute } = require("./services/languageStrategy");
+const { enrichContentLanguageMetadata } = require("./services/contentMetadata");
 
 function cancelledError() {
   const error = new Error("Job cancelado porque a fonte foi excluída");
@@ -48,13 +51,26 @@ function cachedExtraction(sourceId, fingerprint) {
   if (!fs.existsSync(file) || !meta.origin || meta.extractionFingerprint !== fingerprint) return null;
   const content = fs.readFileSync(file, "utf8");
   if (!removeEmptyCues(parseVtt(content)).length) return null;
-  return { content, lang: meta.languageDeclared || "und", name: meta.origin, trackIndex: meta.trackIndex ?? null, cached: true };
+  return {
+    content, lang: meta.languageDeclared || "und", name: meta.origin, trackIndex: meta.trackIndex ?? null, cached: true,
+    sourceAudioIndex: meta.sourceAudioIndex ?? null,
+    sourceAudioLanguage: meta.sourceAudioLanguage || "und",
+    sourceAudioReason: meta.sourceAudioReason || "cached",
+    sourceAudioConfidence: meta.sourceAudioConfidence || "unknown",
+    translationRoute: meta.translationRoute || "source-language-unverified",
+  };
 }
 
-async function transcribeWithGpu(mediaInput, outputDir, source, job) {
+async function transcribeWithGpu(mediaInput, outputDir, source, job, originalAudio = null) {
+  if (/^https?:/i.test(String(mediaInput))) throw new Error("Remote adaptive streams without a subtitle track cannot be transcribed safely; use a downloadable media URL or torrent source");
   return withGpuLock(`transcribe:${source.sourceId}`, async () => {
     assertJobActive(job);
-    return transcribeSource(mediaInput, outputDir, source.sourceId, [source.filename, source.name].filter(Boolean).join(". "));
+    return transcribeSource(mediaInput, outputDir, source.sourceId, [source.filename, source.name].filter(Boolean).join(". "), {
+      audioStreamIndex: originalAudio?.ffIndex,
+      language: speechRecognitionLanguage(originalAudio?.lang),
+      reason: originalAudio?.reason,
+      confidence: originalAudio?.confidence,
+    });
   });
 }
 
@@ -79,16 +95,25 @@ function cueMilliseconds(cue) {
   };
 }
 
+function expectedDisplayedText(value) {
+  return displayChunks(localizeBrazilianPortuguese(value)).join(" ");
+}
+
 async function extract(mediaInput, source, outputDir, job) {
+  let originalAudio = null;
   try {
-    if (/\.m3u8(?:$|\?)/i.test(mediaInput)) return await extractHlsSubtitle(mediaInput, { preferredLangs: config.preferredSubtitleLangs });
-    if (/\.mpd(?:$|\?)/i.test(mediaInput)) return await extractDashSubtitle(mediaInput, { preferredLangs: config.preferredSubtitleLangs });
-    return await extractFileSubtitle(mediaInput, outputDir, config.preferredSubtitleLangs);
+    if (/\.m3u8(?:$|\?)/i.test(mediaInput)) return await extractHlsSubtitle(mediaInput, { preferredLangs: config.preferredSubtitleLangs, source, targetLocale: config.targetLocale });
+    if (/\.mpd(?:$|\?)/i.test(mediaInput)) return await extractDashSubtitle(mediaInput, { preferredLangs: config.preferredSubtitleLangs, source, targetLocale: config.targetLocale });
+    const mediaTracks = await probeMediaTracks(mediaInput);
+    originalAudio = selectOriginalAudio(mediaTracks.audioTracks, source);
+    return await extractFileSubtitle(mediaInput, outputDir, config.preferredSubtitleLangs, {
+      mediaTracks, source, targetLocale: config.targetLocale,
+    });
   } catch (error) {
     if (error.code === "SOURCE_CANCELLED") throw error;
     transition(source.sourceId, "transcribing", { extractionError: error.message });
     logger.info("Preparing subtitles", { sourceId: source.sourceId, stage: "transcribing", reason: error.message });
-    return transcribeWithGpu(mediaInput, outputDir, source, job);
+    return transcribeWithGpu(mediaInput, outputDir, source, job, originalAudio);
   }
 }
 
@@ -106,7 +131,7 @@ async function processJob(job) {
     let mediaDuration = null;
     if (mediaInput) {
       assertJobActive(job);
-      const validation = validateLocalMedia(mediaInput);
+      const validation = await validateLocalMedia(mediaInput);
       if (!validation.valid) {
         source = await recoverCorruptMedia(source, validation, async (state) => {
           assertJobActive(job);
@@ -150,7 +175,7 @@ async function processJob(job) {
       assertJobActive(job);
       sourceStore.upsert({ ...source, ...acquired, acquisitionState: "ready" });
       logger.info("Torrent download completed", { sourceId, fileName: acquired.fileName, size: acquired.size });
-      const validation = validateLocalMedia(mediaInput);
+      const validation = await validateLocalMedia(mediaInput);
       if (!validation.valid) {
         source = await recoverCorruptMedia({ ...source, ...acquired, localPath: mediaInput }, validation, async (state) => {
           assertJobActive(job);
@@ -158,15 +183,21 @@ async function processJob(job) {
           await job.updateProgress(state);
         });
         mediaInput = source.localPath;
-        mediaDuration = validateLocalMedia(mediaInput).duration;
+        mediaDuration = (await validateLocalMedia(mediaInput)).duration;
       } else mediaDuration = validation.duration;
     } else if (!mediaInput && source.url) {
       await assertSafeRemoteUrl(source.url);
-      mediaInput = source.url;
+      if (/\.(?:m3u8|mpd)(?:$|\?)/i.test(source.url)) mediaInput = source.url;
+      else {
+        mediaInput = await downloadRemoteMedia(source);
+        source = sourceStore.upsert({ ...source, localPath: mediaInput, acquisitionState: "ready" });
+      }
     }
     if (!mediaInput) throw new Error("Source cannot be acquired");
+    const enrichedSource = await enrichContentLanguageMetadata(source);
+    if (enrichedSource !== source) source = sourceStore.upsert(enrichedSource);
     assertJobActive(job);
-    transition(sourceId, "probing", { progress: 38 });
+    transition(sourceId, "probing", { progress: 38, error: null });
     logger.info("Preparing subtitles", { sourceId, stage: "probing" });
     const fingerprint = mediaFingerprint(mediaInput);
     let extraction = cachedExtraction(sourceId, fingerprint) || await extract(mediaInput, source, outputDir, job);
@@ -174,9 +205,19 @@ async function processJob(job) {
     const excludedTrackIndexes = [];
     while (true) {
       assertJobActive(job);
-      fs.writeFileSync(subtitlePath(sourceId, "original.vtt"), extraction.content, "utf8");
-      transition(sourceId, "synchronizing", { progress: 50, origin: extraction.name, languageDeclared: extraction.lang, trackIndex: extraction.trackIndex ?? null, extractionFingerprint: fingerprint, extractionCached: Boolean(extraction.cached) });
       parsedCues = removeEmptyCues(parseVtt(extraction.content));
+      if (extraction.name.startsWith("ocr-pgs")) {
+        if (!extraction.cached) fs.writeFileSync(subtitlePath(sourceId, "original-raw.vtt"), extraction.content, "utf8");
+        parsedCues = parsedCues.map((cue) => ({ ...cue, text: normalizeOcrSourceText(cue.text) }));
+        extraction = { ...extraction, content: serializeVtt(parsedCues) };
+      }
+      fs.writeFileSync(subtitlePath(sourceId, "original.vtt"), extraction.content, "utf8");
+      transition(sourceId, "synchronizing", {
+        progress: 50, origin: extraction.name, languageDeclared: extraction.lang, trackIndex: extraction.trackIndex ?? null,
+        extractionFingerprint: fingerprint, extractionCached: Boolean(extraction.cached), sourceAudioIndex: extraction.sourceAudioIndex ?? null,
+        sourceAudioLanguage: extraction.sourceAudioLanguage || "und", sourceAudioReason: extraction.sourceAudioReason || "unavailable",
+        sourceAudioConfidence: extraction.sourceAudioConfidence || "unknown", translationRoute: extraction.translationRoute || "source-language-unverified",
+      });
       if (extraction.name === "faster-whisper") break;
       try {
         assertSubtitleCompleteness(parsedCues, mediaDuration);
@@ -186,63 +227,120 @@ async function processJob(job) {
           excludedTrackIndexes.push(extraction.trackIndex);
           try {
             logger.warn("Embedded subtitle is incomplete; trying the next embedded track", { sourceId, trackIndex: extraction.trackIndex, error: error.message });
-            extraction = await extractFileSubtitle(mediaInput, outputDir, config.preferredSubtitleLangs, { excludedTrackIndexes });
+            extraction = await extractFileSubtitle(mediaInput, outputDir, config.preferredSubtitleLangs, { excludedTrackIndexes, source, targetLocale: config.targetLocale });
             continue;
           } catch (nextError) {
             logger.warn("No complete embedded subtitle remains; transcribing full audio", { sourceId, error: nextError.message });
           }
         } else logger.warn("Embedded subtitle is incomplete; transcribing full audio instead", { sourceId, error: error.message });
         transition(sourceId, "transcribing", { progress: 42, extractionError: error.message });
-        extraction = await transcribeWithGpu(mediaInput, outputDir, source, job);
+        const mediaTracks = fs.existsSync(mediaInput) ? await probeMediaTracks(mediaInput) : null;
+        extraction = await transcribeWithGpu(mediaInput, outputDir, source, job, mediaTracks ? selectOriginalAudio(mediaTracks.audioTracks, source) : null);
       }
     }
-    const cues = extraction.name === "faster-whisper" ? mergeShortCues(parsedCues) : parsedCues;
+    let cues = extraction.name === "faster-whisper" ? mergeShortCues(parsedCues) : parsedCues;
     if (!cues.length) throw new Error("Subtitle contains no valid cues");
     // OCR/text tracks can legitimately keep an on-screen sign for longer.
     // Audio transcription must stay strict because long cues usually mean
     // Whisper swallowed dialogue and produced a timing hole.
-    const maxCueSeconds = extraction.name === "faster-whisper" ? 20 : 60;
-    const sourceQuality = assertCueIntegrity(cues, { maxCueSeconds });
+    let maxCueSeconds = extraction.name === "faster-whisper" ? 20 : 60;
+    let sourceQuality;
+    try {
+      sourceQuality = assertCueIntegrity(cues, { maxCueSeconds });
+    } catch (transcriptionError) {
+      if (extraction.name !== "faster-whisper" || !fs.existsSync(mediaInput)) throw transcriptionError;
+      logger.warn("Original-audio transcription failed structural validation; using a complete intermediate subtitle as a verified fallback", {
+        sourceId, language: extraction.sourceAudioLanguage, error: transcriptionError.message,
+      });
+      const mediaTracks = await probeMediaTracks(mediaInput);
+      extraction = await extractFileSubtitle(mediaInput, outputDir, config.preferredSubtitleLangs, {
+        mediaTracks, source, targetLocale: config.targetLocale, allowIntermediateFallback: true,
+      });
+      parsedCues = removeEmptyCues(parseVtt(extraction.content));
+      if (extraction.name.startsWith("ocr-pgs")) {
+        fs.writeFileSync(subtitlePath(sourceId, "original-raw.vtt"), extraction.content, "utf8");
+        parsedCues = parsedCues.map((cue) => ({ ...cue, text: normalizeOcrSourceText(cue.text) }));
+        extraction = { ...extraction, content: serializeVtt(parsedCues) };
+      }
+      assertSubtitleCompleteness(parsedCues, mediaDuration);
+      fs.writeFileSync(subtitlePath(sourceId, "original.vtt"), extraction.content, "utf8");
+      transition(sourceId, "synchronizing", {
+        progress: 50, origin: extraction.name, languageDeclared: extraction.lang, trackIndex: extraction.trackIndex ?? null,
+        extractionFingerprint: fingerprint, extractionCached: false, sourceAudioIndex: extraction.sourceAudioIndex ?? null,
+        sourceAudioLanguage: extraction.sourceAudioLanguage || "und", sourceAudioReason: extraction.sourceAudioReason || "unavailable",
+        sourceAudioConfidence: extraction.sourceAudioConfidence || "unknown", translationRoute: extraction.translationRoute || "intermediate-language-fallback",
+        transcriptionFallbackReason: transcriptionError.message,
+      });
+      cues = parsedCues;
+      maxCueSeconds = 60;
+      sourceQuality = assertCueIntegrity(cues, { maxCueSeconds });
+    }
 
     transition(sourceId, "contextualizing", { progress: 55 });
     const sample = cues.slice(0, 20).map((cue) => cue.text).join("\n").slice(0, 4000);
-    const detected = await detectLanguage(sample, config.libreTranslateUrl);
-    const isPortuguese = detected.startsWith("pt") || detected === "pb" || /^(pt|pb)/i.test(String(extraction.lang || ""));
+    const detected = canonicalLanguage(await detectLanguage(sample, config.libreTranslateUrl));
+    const declaredLanguage = canonicalLanguage(extraction.lang);
+    const sourceLanguage = detected !== "und" ? detected : declaredLanguage;
+    const effectiveTranslationRoute = extraction.name === "faster-whisper"
+      ? "direct-original-audio-transcription"
+      : translationRoute(sourceLanguage, extraction.sourceAudioLanguage && extraction.sourceAudioLanguage !== "und"
+        ? { lang: extraction.sourceAudioLanguage } : null);
+    const isPortuguese = languageMatches(sourceLanguage, "pt") || languageMatches(declaredLanguage, "pt");
     if (isPortuguese) {
       const finalized = finalizeCues(cues);
       const vtt = serializeVtt(finalized);
       const validatedCues = parseVtt(vtt);
       if (validatedCues.length !== finalized.length) throw new Error(`Final VTT validation failed: expected ${finalized.length} cues, parsed ${validatedCues.length}`);
-      const finalQuality = assertCueIntegrity(validatedCues, { maxCueSeconds, maxLineChars: 42 });
+      assertTranslationsPreserved(cues, cues.map((cue) => expectedDisplayedText(cue.text)), finalized);
+      const finalQuality = assertCueIntegrity(validatedCues, { maxCueSeconds, maxLineChars: 42, maxLines: 2 });
       assertJobActive(job);
       fs.writeFileSync(finalPath, vtt, "utf8");
       await prepareLocalPlayback(sourceId, mediaInput, finalPath);
       assertJobActive(job);
       clearFailureMarker(sourceId);
-      transition(sourceId, "ready", { progress: 100, translated: false, languageDetected: detected, cues: finalized.length, origin: extraction.name, sourceQuality, finalQuality });
+      transition(sourceId, "ready", {
+        progress: 100, translated: false, languageDetected: detected, translationSourceLanguage: sourceLanguage,
+        translationRoute: effectiveTranslationRoute, cues: finalized.length, origin: extraction.name,
+        sourceAudioIndex: extraction.sourceAudioIndex ?? null, sourceAudioLanguage: extraction.sourceAudioLanguage || "und",
+        sourceAudioReason: extraction.sourceAudioReason || "unavailable", sourceAudioConfidence: extraction.sourceAudioConfidence || "unknown",
+        sourceQuality, finalQuality,
+      });
       scheduleSeriesPrefetch(sourceId, { force: true }).catch((error) => logger.warn("Post-processing prefetch failed", { sourceId, error: error.message }));
       return { status: "ready", translated: false, cues: finalized.length };
     }
 
-    transition(sourceId, "translating", { progress: 65, languageDetected: detected });
-    logger.info("Preparing subtitles", { sourceId, stage: "translating", languageDetected: detected });
+    transition(sourceId, "translating", { progress: 65, languageDetected: detected, translationSourceLanguage: sourceLanguage });
+    logger.info("Preparing subtitles", { sourceId, stage: "translating", languageDetected: detected, translationSourceLanguage: sourceLanguage });
     const sourceTexts = cues.map((cue) => String(cue.text || "").replace(/\s*\n\s*/g, " ").replace(/\s+/g, " ").trim());
-    const contextualInput = cues.map((cue, index) => ({ text: sourceTexts[index], ...cueMilliseconds(cue) }));
+    const contextualInput = cues.map((cue, index) => ({
+      text: sourceTexts[index],
+      sourceLang: looksRomanizedJapanese(sourceTexts[index]) ? "ja-Latn" : sourceLanguage,
+      ...cueMilliseconds(cue),
+    }));
+    const protectedTerms = inferProtectedTerms(contextualInput);
     let forcedAlignment = null;
-    if (config.forcedAlignmentEnabled && config.intelligenceUrl && extraction.name !== "faster-whisper") {
+    const alignmentLanguageCompatible = !extraction.sourceAudioLanguage || extraction.sourceAudioLanguage === "und"
+      || languageMatches(sourceLanguage, extraction.sourceAudioLanguage);
+    if (config.forcedAlignmentEnabled && config.intelligenceUrl && extraction.name !== "faster-whisper" && alignmentLanguageCompatible) {
       transition(sourceId, "aligning", { progress: 60 });
-      logger.info("Aligning official subtitles to spoken audio", { sourceId, language: detected });
+      const alignmentLanguage = extraction.sourceAudioLanguage && extraction.sourceAudioLanguage !== "und" ? extraction.sourceAudioLanguage : sourceLanguage;
+      logger.info("Aligning official subtitles to spoken audio", { sourceId, language: alignmentLanguage, audioStream: extraction.sourceAudioIndex ?? null });
       try {
         forcedAlignment = await withGpuLock(`align:${sourceId}`, () => fetchWordTimestamps(mediaInput, outputDir, sourceId, {
             endpoint: config.intelligenceUrl,
-            language: detected.startsWith("en") ? "en" : detected,
+            language: speechRecognitionLanguage(alignmentLanguage),
+            audioStreamIndex: extraction.sourceAudioIndex,
             prompt: [source.filename, source.title, source.name].filter(Boolean).join(". "),
             timeoutMs: config.forcedAlignmentTimeoutMs,
           }));
       } catch (error) {
         logger.warn("Forced alignment unavailable; preserving official cue timing", { sourceId, error: error.message });
       }
-      transition(sourceId, "translating", { progress: 65, languageDetected: detected });
+      transition(sourceId, "translating", { progress: 65, languageDetected: detected, translationSourceLanguage: sourceLanguage });
+    } else if (extraction.name !== "faster-whisper" && !alignmentLanguageCompatible) {
+      logger.info("Preserving official subtitle timing because subtitle and audio languages differ", {
+        sourceId, subtitleLanguage: sourceLanguage, audioLanguage: extraction.sourceAudioLanguage,
+      });
     }
     let texts;
     let translationProvider = `ollama:${config.contextualTranslatorModel}`;
@@ -253,18 +351,20 @@ async function processJob(job) {
         texts = await translateContextual(contextualInput, {
           endpoint: config.contextualTranslatorUrl,
           model: config.contextualTranslatorModel,
-          sourceLang: detected,
+          sourceLang: sourceLanguage,
           targetLocale: config.targetLocale,
           contextTitle: [source.filename, source.title, source.name].filter(Boolean).join(" · ").slice(0, 1000),
+          protectedTerms,
           maxChars: config.translateBatchChars,
           maxCues: config.contextualTranslatorMaxCues,
+          contextCues: config.contextualTranslatorContextCues,
           timeoutMs: config.contextualTranslatorTimeoutMs,
         });
       } catch (error) {
         if (!config.allowLiteralTranslationFallback) throw new Error(`Tradução contextual falhou; legenda literal não será publicada: ${error.message}`);
         logger.warn("Using explicitly enabled literal translation fallback", { sourceId, error: error.message });
         translationProvider = "libretranslate-fallback";
-        texts = await translateBatch(sourceTexts, config.libreTranslateUrl, config.targetLocale, detected, config.translateBatchChars);
+        texts = await translateBatch(sourceTexts, config.libreTranslateUrl, config.targetLocale, sourceLanguage, config.translateBatchChars);
       } finally {
         await unloadContextualModel(config.contextualTranslatorUrl, config.contextualTranslatorModel);
       }
@@ -278,7 +378,7 @@ async function processJob(job) {
       // Alignment chooses the spoken phrase boundaries. Finalization only
       // subdivides visually dense phrases inside those ranges, preserving all
       // translated text while enforcing readable two-line captions.
-      translated = finalizeCues(aligned.cues);
+      translated = finalizeCues(aligned.cues, { keepTogetherTerms: protectedTerms });
       alignmentQuality = {
         ...aligned.stats,
         audioStream: forcedAlignment.audioStream,
@@ -286,8 +386,9 @@ async function processJob(job) {
         detectedWords: forcedAlignment.words.length,
       };
     } else {
-      translated = finalizeCues(cues.map((cue, index) => ({ ...cue, text: texts[index] })));
+      translated = finalizeCues(cues.map((cue, index) => ({ ...cue, text: texts[index] })), { keepTogetherTerms: protectedTerms });
     }
+    assertTranslationsPreserved(cues, texts.map(expectedDisplayedText), translated);
     transition(sourceId, "validating", { progress: 95 });
     const vtt = serializeVtt(translated);
     const validatedCues = parseVtt(vtt);
@@ -295,7 +396,7 @@ async function processJob(job) {
       fs.writeFileSync(subtitlePath(sourceId, "validation-debug.vtt"), vtt, "utf8");
       throw new Error(`Final VTT validation failed: expected ${translated.length} cues, parsed ${validatedCues.length}`);
     }
-    const finalQuality = assertCueIntegrity(validatedCues, { maxCueSeconds, maxLineChars: 42 });
+    const finalQuality = assertCueIntegrity(validatedCues, { maxCueSeconds, maxLineChars: 42, maxLines: 2 });
     assertJobActive(job);
     fs.writeFileSync(finalPath, vtt, "utf8");
     await prepareLocalPlayback(sourceId, mediaInput, finalPath);
@@ -305,11 +406,16 @@ async function processJob(job) {
     transition(sourceId, "ready", {
       progress: 100,
       translated: true,
-      from: detected,
+      from: sourceLanguage,
       to: mapTargetLocale(config.targetLocale),
       cues: translated.length,
       origin: extraction.name,
       translationProvider,
+      translationRoute: effectiveTranslationRoute,
+      sourceAudioIndex: extraction.sourceAudioIndex ?? null,
+      sourceAudioLanguage: extraction.sourceAudioLanguage || "und",
+      sourceAudioReason: extraction.sourceAudioReason || "unavailable",
+      sourceAudioConfidence: extraction.sourceAudioConfidence || "unknown",
       alignmentQuality,
       sourceQuality,
       finalQuality,

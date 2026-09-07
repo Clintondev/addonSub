@@ -4,7 +4,11 @@ const { execFile, spawn } = require("child_process");
 const config = require("../config");
 const logger = require("../logger");
 const { safeChildPath, stableHash } = require("../utils/security");
+const { writeJsonFileAtomic } = require("../utils/atomicJson");
 const { acquireGpuLock } = require("./gpuLock");
+const { acquireSemaphoreSlot } = require("./distributedSemaphore");
+const { reserveStorage } = require("./storageQuota");
+const { directorySize, invalidateStorageUsage } = require("./storageUsage");
 
 const active = new Map();
 const starting = new Map();
@@ -36,7 +40,7 @@ async function probeMedia(input) {
     "-show_entries", "stream=index,codec_type,codec_name,profile,pix_fmt,channels,disposition:stream_tags=language,title:format=duration",
     "-of", "json",
     input,
-  ]);
+  ], { timeout: 30000 });
   return JSON.parse(stdout);
 }
 
@@ -83,10 +87,9 @@ function choosePlan(probe, nvencAvailable) {
       language: String(stream.tags?.language || "und").toLowerCase(),
       title: stream.tags?.title || null,
       isDefault: outputIndex === defaultAudioIndex,
-      // Keep the default rendition in-band as a compatibility fallback, but
-      // also publish every language as an explicit rendition. Web players
-      // only expose an audio selector when each choice has its own URI.
-      playlist: `audio-${outputIndex}.m3u8`,
+      // Keep the default rendition in-band as a compatibility fallback and
+      // publish only alternate languages as explicit selectable renditions.
+      playlist: outputIndex === defaultAudioIndex ? null : `audio-${outputIndex}.m3u8`,
     })),
   };
 }
@@ -191,8 +194,8 @@ function inputFingerprint(input, subtitleFile = null) {
   return stableHash(JSON.stringify({ input: identity(input), subtitle: subtitleFile ? identity(subtitleFile) : null }), 48);
 }
 
-function writeMetadata(sourceId, plan, fingerprint) {
-  fs.writeFileSync(metadataPath(sourceId), JSON.stringify({ version: HLS_CACHE_VERSION, fingerprint, plan }, null, 2), "utf8");
+function writeMetadata(sourceId, plan, fingerprint, outputBytes = 0) {
+  writeJsonFileAtomic(metadataPath(sourceId), { version: HLS_CACHE_VERSION, fingerprint, plan, outputBytes });
 }
 
 function readMetadata(sourceId) {
@@ -231,46 +234,85 @@ function waitForPlaylist(playlist, child, timeoutMs) {
 }
 
 async function startHls(sourceId, input, { subtitleFile = null, fingerprint = inputFingerprint(input, subtitleFile) } = {}) {
-  if (active.size >= config.hls.maxConcurrent) throw new Error("Conversor HLS ocupado; tente novamente em instantes");
+  let releaseSlot;
+  try {
+    releaseSlot = await acquireSemaphoreSlot("hls", config.hls.maxConcurrent, { owner: `hls:${sourceId}`, leaseMs: config.storageReservationLeaseMs });
+  } catch (_) {
+    throw new Error("Conversor HLS ocupado; tente novamente em instantes");
+  }
   const dir = outputDir(sourceId);
   const playlist = outputPath(sourceId, "video.m3u8");
-  if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
-  fs.mkdirSync(dir, { recursive: true });
-
-  const probe = await probeMedia(input);
-  const nvencAvailable = await supportsNvenc();
-  const plan = choosePlan(probe, nvencAvailable);
-  if (subtitleFile) {
-    plan.videoMode = nvencAvailable ? "nvenc" : "cpu";
-    plan.subtitleBurnedIn = true;
-  }
-  const releaseGpu = plan.videoMode === "nvenc"
-    ? await acquireGpuLock(`hls:${sourceId}`, { waitMs: config.hls.startTimeoutMs })
-    : null;
-  const args = buildFfmpegArgs(input, playlist, plan, config.hls, subtitleFile);
-  writeMetadata(sourceId, plan, fingerprint);
-  logger.info("Iniciando stream HLS", { sourceId, ...plan });
+  let releaseStorage = null;
+  let releaseGpu = null;
   let child;
-  try { child = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] }); }
-  catch (error) { await releaseGpu?.(); throw error; }
+  let plan;
+  try {
+    const previousBytes = readMetadata(sourceId)?.outputBytes || 0;
+    const probe = await probeMedia(input);
+    const durationSeconds = Number(probe.format?.duration || 0);
+    const audioCount = (probe.streams || []).filter((stream) => stream.codec_type === "audio").length;
+    const bitrateEstimate = durationSeconds > 0
+      ? Math.ceil(durationSeconds * (config.hls.videoBitrateKbps + audioCount * config.hls.audioBitrateKbps) * 1000 / 8 * 1.08)
+      : 0;
+    const outputEstimate = Math.max(fs.statSync(input).size, bitrateEstimate);
+    releaseStorage = await reserveStorage(Math.max(0, outputEstimate - previousBytes), `hls:${sourceId}`);
+    const nvencAvailable = await supportsNvenc();
+    plan = choosePlan(probe, nvencAvailable);
+    if (subtitleFile) {
+      plan.videoMode = nvencAvailable ? "nvenc" : "cpu";
+      plan.subtitleBurnedIn = true;
+    }
+    releaseGpu = plan.videoMode === "nvenc"
+      ? await acquireGpuLock(`hls:${sourceId}`, { waitMs: config.hls.startTimeoutMs })
+      : null;
+    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+    fs.mkdirSync(dir, { recursive: true });
+    const args = buildFfmpegArgs(input, playlist, plan, config.hls, subtitleFile);
+    writeMetadata(sourceId, plan, fingerprint);
+    logger.info("Iniciando stream HLS", { sourceId, ...plan });
+    child = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
+  } catch (error) {
+    await releaseGpu?.();
+    await releaseStorage?.();
+    await releaseSlot();
+    throw error;
+  }
   let stderr = "";
   child.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-12000); });
 
+  let resourcesReleased = false;
+  const releaseResources = async () => {
+    if (resourcesReleased) return;
+    resourcesReleased = true;
+    await releaseGpu?.();
+    await releaseStorage?.();
+    await releaseSlot();
+  };
+
   const done = new Promise((resolve, reject) => {
-    child.once("error", (error) => {
+    child.once("error", async (error) => {
       active.delete(sourceId);
-      releaseGpu?.().catch(() => {});
+      await releaseResources();
       reject(error);
     });
-    child.once("exit", (code) => {
+    child.once("exit", async (code) => {
       active.delete(sourceId);
-      releaseGpu?.().catch(() => {});
       if (code === 0) {
-        logger.info("Stream HLS concluído", { sourceId, playlist });
-        resolve(playlist);
+        try {
+          const outputBytes = await directorySize(dir);
+          writeMetadata(sourceId, plan, fingerprint, outputBytes);
+          invalidateStorageUsage();
+          logger.info("Stream HLS concluído", { sourceId, playlist, outputBytes });
+          await releaseResources();
+          resolve(playlist);
+        } catch (error) {
+          await releaseResources();
+          reject(error);
+        }
       } else {
         const error = new Error(`FFmpeg HLS encerrou com código ${code}: ${stderr.trim().slice(-1000)}`);
         logger.error("Falha no stream HLS", { sourceId, error: error.message });
+        await releaseResources();
         reject(error);
       }
     });
@@ -314,8 +356,16 @@ function pruneHlsCache(now = Date.now()) {
   for (const entry of fs.readdirSync(config.hlsDir, { withFileTypes: true })) {
     if (!entry.isDirectory() || active.has(entry.name)) continue;
     const dir = outputDir(entry.name);
-    if (fs.statSync(dir).mtimeMs < cutoff) fs.rmSync(dir, { recursive: true, force: true });
+    if (fs.statSync(dir).mtimeMs < cutoff) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      invalidateStorageUsage();
+    }
   }
+}
+
+function storageBytes(sourceId) {
+  const metadata = readMetadata(sourceId);
+  return Number(metadata?.outputBytes || 0);
 }
 
 let pruneTimer;
@@ -344,5 +394,6 @@ module.exports = {
   probeMedia,
   pruneHlsCache,
   scheduleHlsCachePruning,
+  storageBytes,
   supportsNvenc,
 };

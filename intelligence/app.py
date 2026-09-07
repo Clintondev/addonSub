@@ -1,5 +1,6 @@
 import os
 import gc
+import logging
 from pathlib import Path
 from threading import Lock
 
@@ -12,12 +13,14 @@ app = FastAPI(title="PT-AUTO Intelligence Worker")
 storage_root = Path(os.environ.get("STORAGE_DIR", "/usr/src/app/storage")).resolve()
 model = None
 model_lock = Lock()
+logger = logging.getLogger("pt-auto-intelligence")
 
 
 class TranscriptionRequest(BaseModel):
     sourceId: str
     audioPath: str
     prompt: str = ""
+    language: str | None = None
 
 
 class AlignmentRequest(BaseModel):
@@ -56,19 +59,32 @@ def storage_file(value: str, field: str) -> Path:
         raise HTTPException(status_code=400, detail=f"{field} must be an existing file inside storage")
 
 
-def transcription_options():
+def transcription_options(recovery: bool = False):
+    vad_threshold = float(os.environ.get("WHISPER_VAD_THRESHOLD", "0.35"))
     return {
         "vad_filter": True,
         "vad_parameters": {
-            "threshold": float(os.environ.get("WHISPER_VAD_THRESHOLD", "0.35")),
+            "threshold": max(vad_threshold, 0.45) if recovery else vad_threshold,
             "min_speech_duration_ms": int(os.environ.get("WHISPER_VAD_MIN_SPEECH_MS", "120")),
-            "min_silence_duration_ms": int(os.environ.get("WHISPER_VAD_MIN_SILENCE_MS", "700")),
+            "min_silence_duration_ms": 400 if recovery else int(os.environ.get("WHISPER_VAD_MIN_SILENCE_MS", "700")),
             "speech_pad_ms": int(os.environ.get("WHISPER_VAD_SPEECH_PAD_MS", "500")),
         },
         "beam_size": int(os.environ.get("WHISPER_BEAM_SIZE", "5")),
         "word_timestamps": True,
-        "condition_on_previous_text": True,
+        "condition_on_previous_text": not recovery,
+        "hallucination_silence_threshold": 1.0 if recovery else float(os.environ.get("WHISPER_HALLUCINATION_SILENCE_SECONDS", "2.0")),
+        "no_speech_threshold": 0.5 if recovery else float(os.environ.get("WHISPER_NO_SPEECH_THRESHOLD", "0.6")),
     }
+
+
+def run_transcription(audio: Path, request: TranscriptionRequest, recovery: bool = False):
+    segments, info = get_model_unlocked().transcribe(
+        str(audio),
+        **transcription_options(recovery),
+        language=(request.language or "").strip() or None,
+        initial_prompt=request.prompt.strip() or None,
+    )
+    return list(segments), info
 
 
 @app.get("/healthz")
@@ -98,11 +114,18 @@ def transcribe(request: TranscriptionRequest):
     # faster-whisper yields segments lazily. Keep the lock until the generator
     # is fully consumed so /unload and another transcription cannot race it.
     with model_lock:
-        segments, info = get_model_unlocked().transcribe(
-            str(audio),
-            **transcription_options(),
-            initial_prompt=request.prompt.strip() or None,
-        )
+        segments, info = run_transcription(audio, request)
+        abnormal = [segment for segment in segments if float(segment.end) - float(segment.start) > 20]
+        if abnormal:
+            logger.warning(
+                "Retrying transcription with strict silence protection: %s abnormal segments, longest %.1fs",
+                len(abnormal),
+                max(float(segment.end) - float(segment.start) for segment in abnormal),
+            )
+            # This is a fresh inference pass, not a reuse of the defective VTT.
+            # Breaking prompt carry-over prevents one hallucinated phrase from
+            # stretching across music or a long silent interval.
+            segments, info = run_transcription(audio, request, recovery=True)
         lines = ["WEBVTT", ""]
         count = 0
         for segment in segments:

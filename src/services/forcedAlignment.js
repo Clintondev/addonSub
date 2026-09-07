@@ -1,19 +1,14 @@
 const fs = require("fs");
 const path = require("path");
-const { spawn } = require("child_process");
 const fetch = require("node-fetch");
+const config = require("../config");
+const { runProcess } = require("../utils/processRunner");
 const { dialogueTurns, formatTimestamp, localizeBrazilianPortuguese, parseTimestamp } = require("./subtitleQuality");
 
-function run(binary, args, { captureStdout = false } = {}) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(binary, args, { stdio: ["ignore", captureStdout ? "pipe" : "ignore", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout?.on("data", (chunk) => { stdout += chunk; });
-    child.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-8000); });
-    child.once("error", reject);
-    child.once("close", (code) => code === 0 ? resolve(stdout) : reject(new Error(`${binary} exited with ${code}: ${stderr}`)));
-  });
+async function run(binary, args, { captureStdout = false } = {}) {
+  const result = await runProcess(binary, args, { timeoutMs: config.mediaProcessTimeoutMs, maxBuffer: captureStdout ? 8 * 1024 * 1024 : 1024 * 1024 });
+  if (result.status !== 0) throw new Error(`${binary} exited with ${result.status}: ${result.stderr.slice(-8000)}`);
+  return captureStdout ? result.stdout : "";
 }
 
 function cueTiming(cue) {
@@ -41,6 +36,16 @@ function reconstructTranslations(sourceCues, displayCues) {
   if (translations.some((value) => !value)) throw new Error("Could not reconstruct every source translation");
   if (consumed.size !== displayCues.length) throw new Error(`Could not map ${displayCues.length - consumed.size} displayed cues back to source cues`);
   return translations;
+}
+
+function assertTranslationsPreserved(sourceCues, expectedTexts, displayCues) {
+  if (sourceCues.length !== expectedTexts.length) throw new Error("Expected translation count does not match source cues");
+  const normalized = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  reconstructTranslations(sourceCues, displayCues).forEach((text, index) => {
+    if (normalized(text) !== normalized(expectedTexts[index])) {
+      throw new Error(`Formatação ou alinhamento alterou o conteúdo da fala ${index + 1}`);
+    }
+  });
 }
 
 function normalizedToken(value) {
@@ -251,10 +256,14 @@ function buildForcedAlignedCues(sourceCues, translatedTexts, timestampedWords, {
   return { cues: output, stats };
 }
 
-async function selectAudioStream(mediaInput, language = "en") {
+async function selectAudioStream(mediaInput, language = "en", preferredIndex = null) {
   const raw = await run("ffprobe", ["-v", "error", "-select_streams", "a", "-show_entries", "stream=index:stream_tags=language,title", "-of", "json", mediaInput], { captureStdout: true });
   const streams = JSON.parse(raw).streams || [];
   if (!streams.length) throw new Error("Media has no audio streams for forced alignment");
+  if (Number.isInteger(preferredIndex)) {
+    const exact = streams.find((stream) => Number(stream.index) === preferredIndex);
+    if (exact) return exact;
+  }
   const wanted = String(language).toLowerCase();
   return streams.find((stream) => {
     const declared = String(stream.tags?.language || "").toLowerCase();
@@ -267,9 +276,11 @@ async function fetchWordTimestamps(mediaInput, outputDir, sourceId, options) {
   const cachePath = path.join(outputDir, "alignment-en-words.json");
   if (fs.existsSync(cachePath)) {
     const cached = JSON.parse(fs.readFileSync(cachePath, "utf8"));
-    if (Array.isArray(cached.words) && cached.words.length) return cached;
+    const sameStream = !Number.isInteger(options.audioStreamIndex) || Number(cached.audioStream) === options.audioStreamIndex;
+    const sameLanguage = !options.language || String(cached.requestedLanguage || cached.language || "").toLowerCase() === String(options.language).toLowerCase();
+    if (Array.isArray(cached.words) && cached.words.length && sameStream && sameLanguage) return cached;
   }
-  const stream = await selectAudioStream(mediaInput, options.language || "en");
+  const stream = await selectAudioStream(mediaInput, options.language || "en", options.audioStreamIndex);
   const audioPath = path.join(outputDir, "alignment-audio-en.flac");
   await run("ffmpeg", ["-y", "-v", "error", "-i", mediaInput, "-map", `0:${stream.index}`, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "flac", audioPath]);
   const controller = new AbortController();
@@ -285,7 +296,7 @@ async function fetchWordTimestamps(mediaInput, outputDir, sourceId, options) {
     if (!response.ok) throw new Error(`Alignment service returned ${response.status}: ${body.slice(0, 500)}`);
     const parsed = JSON.parse(body);
     if (!Array.isArray(parsed.words) || !parsed.words.length) throw new Error("Alignment service returned no words");
-    const complete = { ...parsed, audioStream: stream.index, audioLanguage: stream.tags?.language || "und" };
+    const complete = { ...parsed, requestedLanguage: options.language || "und", audioStream: stream.index, audioLanguage: stream.tags?.language || "und" };
     const temporary = `${cachePath}.tmp`;
     fs.writeFileSync(temporary, JSON.stringify(complete), "utf8");
     fs.renameSync(temporary, cachePath);
@@ -296,6 +307,7 @@ async function fetchWordTimestamps(mediaInput, outputDir, sourceId, options) {
 }
 
 module.exports = {
+  assertTranslationsPreserved,
   buildForcedAlignedCues,
   fetchWordTimestamps,
   matchedAudioRange,
