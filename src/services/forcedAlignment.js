@@ -3,6 +3,9 @@ const path = require("path");
 const fetch = require("node-fetch");
 const config = require("../config");
 const { runProcess } = require("../utils/processRunner");
+const { mediaIdentity } = require("./mediaIdentity");
+const { writeJsonFileAtomic } = require("../utils/atomicJson");
+const { probeMediaTracks } = require("./ffextract");
 const { dialogueTurns, formatTimestamp, localizeBrazilianPortuguese, parseTimestamp } = require("./subtitleQuality");
 
 async function run(binary, args, { captureStdout = false } = {}) {
@@ -53,7 +56,7 @@ function normalizedToken(value) {
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .toLocaleLowerCase("en")
-    .replace(/[^a-z0-9']/g, "")
+    .replace(/[^\p{L}\p{N}']/gu, "")
     .replace(/^'+|'+$/g, "");
 }
 
@@ -245,6 +248,7 @@ function buildForcedAlignedCues(sourceCues, translatedTexts, timestampedWords, {
     chunks.forEach((text, chunkIndex) => {
       const range = ranges[chunkIndex];
       output.push({
+        sourceIndex: sourceCue.sourceIndex ?? cueIndex,
         id: chunkIndex === 0 ? sourceCue.id : null,
         time: `${formatTimestamp(range.start)} --> ${formatTimestamp(range.end)}${timing.settings}`,
         text: wrapPhrase(text, maxLineChars),
@@ -257,8 +261,7 @@ function buildForcedAlignedCues(sourceCues, translatedTexts, timestampedWords, {
 }
 
 async function selectAudioStream(mediaInput, language = "en", preferredIndex = null) {
-  const raw = await run("ffprobe", ["-v", "error", "-select_streams", "a", "-show_entries", "stream=index:stream_tags=language,title", "-of", "json", mediaInput], { captureStdout: true });
-  const streams = JSON.parse(raw).streams || [];
+  const streams = (await probeMediaTracks(mediaInput)).streams.filter((stream) => stream.codec_type === "audio");
   if (!streams.length) throw new Error("Media has no audio streams for forced alignment");
   if (Number.isInteger(preferredIndex)) {
     const exact = streams.find((stream) => Number(stream.index) === preferredIndex);
@@ -273,12 +276,14 @@ async function selectAudioStream(mediaInput, language = "en", preferredIndex = n
 }
 
 async function fetchWordTimestamps(mediaInput, outputDir, sourceId, options) {
+  const fingerprint = mediaIdentity(mediaInput);
   const cachePath = path.join(outputDir, "alignment-en-words.json");
   if (fs.existsSync(cachePath)) {
-    const cached = JSON.parse(fs.readFileSync(cachePath, "utf8"));
+    let cached;
+    try { cached = JSON.parse(fs.readFileSync(cachePath, "utf8")); } catch (_) { cached = {}; }
     const sameStream = !Number.isInteger(options.audioStreamIndex) || Number(cached.audioStream) === options.audioStreamIndex;
     const sameLanguage = !options.language || String(cached.requestedLanguage || cached.language || "").toLowerCase() === String(options.language).toLowerCase();
-    if (Array.isArray(cached.words) && cached.words.length && sameStream && sameLanguage) return cached;
+    if (cached.version === 2 && cached.fingerprint === fingerprint && Array.isArray(cached.words) && cached.words.length && sameStream && sameLanguage) return cached;
   }
   const stream = await selectAudioStream(mediaInput, options.language || "en", options.audioStreamIndex);
   const audioPath = path.join(outputDir, "alignment-audio-en.flac");
@@ -296,10 +301,8 @@ async function fetchWordTimestamps(mediaInput, outputDir, sourceId, options) {
     if (!response.ok) throw new Error(`Alignment service returned ${response.status}: ${body.slice(0, 500)}`);
     const parsed = JSON.parse(body);
     if (!Array.isArray(parsed.words) || !parsed.words.length) throw new Error("Alignment service returned no words");
-    const complete = { ...parsed, requestedLanguage: options.language || "und", audioStream: stream.index, audioLanguage: stream.tags?.language || "und" };
-    const temporary = `${cachePath}.tmp`;
-    fs.writeFileSync(temporary, JSON.stringify(complete), "utf8");
-    fs.renameSync(temporary, cachePath);
+    const complete = { ...parsed, version: 2, fingerprint, requestedLanguage: options.language || "und", audioStream: stream.index, audioLanguage: stream.tags?.language || "und" };
+    writeJsonFileAtomic(cachePath, complete);
     return complete;
   } finally {
     clearTimeout(timer);

@@ -3,6 +3,7 @@ const logger = require("../logger");
 const { sanitizeUrl } = require("../utils/security");
 const { safeRemoteFetch, safeRemoteText } = require("./safeRemoteFetch");
 const { canonicalLanguage, languageMatches, subtitleLanguageOrder, translationRoute } = require("./languageStrategy");
+const { tryAdaptiveCandidates } = require("./adaptiveCandidates");
 
 function resolveUrl(base, ref) {
   try {
@@ -32,7 +33,7 @@ function listSubtitleReps(manifest, baseUrl) {
       type === "text" ||
       mime.includes("vtt") ||
       mime.includes("ttml") ||
-      mime.includes("mp4")
+      (mime.includes("mp4") && !["video", "audio"].includes(type) && !/^(?:video|audio)\//.test(mime))
     ) {
       const reps = adp.Representation || [];
       const repsArr = Array.isArray(reps) ? reps : [reps];
@@ -48,6 +49,7 @@ function listSubtitleReps(manifest, baseUrl) {
           url = resolveUrl(baseUrl, base);
         }
         lists.push({
+          name: rep["@_label"] || adp["@_label"] || "dash-sub",
           lang: repLang,
           mime: repMime,
           url,
@@ -99,7 +101,7 @@ async function extractDashSubtitle(mpdUrl, options = {}) {
     throw new Error("Nenhuma legenda encontrada no MPD");
   }
   const strategy = subtitleLanguageOrder({ source: options.source, audioTracks, preferredLangs, targetLocale: options.targetLocale });
-  const track = pickTrack(tracks, strategy.languages);
+  return tryAdaptiveCandidates(tracks, strategy, options, async (track) => {
   logger.info("Selecionada trilha DASH", {
     lang: track.lang,
     mime: track.mime,
@@ -118,6 +120,7 @@ async function extractDashSubtitle(mpdUrl, options = {}) {
     sourceAudioConfidence: strategy.originalAudio?.confidence || "unknown",
     translationRoute: translationRoute(track.lang, strategy.originalAudio),
   };
+  });
 }
 
 module.exports = {

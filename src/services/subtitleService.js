@@ -3,8 +3,8 @@ const config = require("../config");
 const logger = require("../logger");
 const { enqueueSubtitleJob } = require("../jobs/queue");
 const { signPath, safeChildPath } = require("../utils/security");
-const { inc } = require("../metrics");
-const { repairSubtitleLayout } = require("./subtitleLayout");
+const { readPublication } = require("./subtitlePublication");
+const { readMeta } = require("./metadata");
 const { parseVtt } = require("./vtt");
 const { clearCancellation } = require("./cancellationStore");
 
@@ -20,9 +20,9 @@ function subtitlePath(sourceId, fileName) {
   return safeChildPath(sourceDir(sourceId), fileName);
 }
 
-function subtitleUrl(sourceId, fileName) {
+function subtitleUrl(sourceId, fileName, version = null) {
   const { token } = signPath([sourceId, fileName], config.subtitleTokenSecret, config.signedUrlTtlSeconds);
-  return `${config.baseUrl}/assets/subtitles/${encodeURIComponent(sourceId)}/${encodeURIComponent(fileName)}?token=${token}`;
+  return `${config.baseUrl}/assets/subtitles/${encodeURIComponent(sourceId)}/${encodeURIComponent(fileName)}?token=${token}${version ? `&v=${version}` : ""}`;
 }
 
 function vttToSrt(vtt) {
@@ -44,35 +44,44 @@ function ensureSrtSubtitle(sourceId, translated) {
 }
 
 function translationStatus(sourceId) {
-  const translated = subtitlePath(sourceId, "pt-BR.vtt");
-  if (fs.existsSync(translated)) {
-    try { repairSubtitleLayout(sourceId); } catch (error) { logger.warn("Falha ao preservar layout da legenda", { sourceId, error: error.message }); }
-    let srt = null;
-    try { srt = ensureSrtSubtitle(sourceId, translated); }
-    catch (error) { logger.warn("Falha ao gerar fallback SRT", { sourceId, error: error.message }); }
-    inc("cache_hits");
-    const ass = subtitlePath(sourceId, "pt-BR.ass");
+  const publication = readPublication(sourceId);
+  const legacy = !fs.existsSync(subtitlePath(sourceId, "publication.json")) && readMeta(sourceId).stage === "ready";
+  const translated = publication ? pathFromPublication(publication, "pt-BR.vtt") : subtitlePath(sourceId, "pt-BR.vtt");
+  if (publication || (legacy && fs.existsSync(translated))) {
+    const srtFile = publication ? pathFromPublication(publication, "pt-BR.srt") : subtitlePath(sourceId, "pt-BR.srt");
+    const srt = fs.existsSync(srtFile) ? srtFile : null;
+    const ass = publication ? pathFromPublication(publication, "pt-BR.ass") : subtitlePath(sourceId, "pt-BR.ass");
+    const version = publication?.generation || null;
     return {
       status: "ready",
+      version,
+      legacy: !publication,
       path: translated,
-      url: subtitleUrl(sourceId, "pt-BR.vtt"),
+      url: subtitleUrl(sourceId, "pt-BR.vtt", version),
       srtPath: srt,
-      srtUrl: srt ? subtitleUrl(sourceId, "pt-BR.srt") : null,
+      srtUrl: srt ? subtitleUrl(sourceId, "pt-BR.srt", version) : null,
       assPath: fs.existsSync(ass) ? ass : null,
-      assUrl: fs.existsSync(ass) ? subtitleUrl(sourceId, "pt-BR.ass") : null,
+      assUrl: fs.existsSync(ass) ? subtitleUrl(sourceId, "pt-BR.ass", version) : null,
     };
   }
   const failed = subtitlePath(sourceId, "failed.json");
   return { status: fs.existsSync(failed) ? "failed" : "pending" };
 }
 
-async function queueTranslationJob(sourceId, priority = 5) {
+function pathFromPublication(publication, fileName) { return safeChildPath(publication.directory, fileName); }
+
+async function queueTranslationJob(sourceId, priority = 5, options = {}) {
+  if (["web", "local"].includes(options.playbackProfile)) {
+    const sourceStore = require("./sourceStore");
+    const source = sourceStore.get(sourceId);
+    if (source && source.playbackProfile !== options.playbackProfile) sourceStore.upsert({ ...source, playbackProfile: options.playbackProfile });
+  }
   // Source ids are deterministic. Deleting an episode and selecting the same
   // release later therefore reuses the id; the old tombstone must not cancel
   // the newly requested job.
   clearCancellation(sourceId);
   ensureSourceDir(sourceId);
-  return enqueueSubtitleJob({ sourceId, requestedAt: Date.now() }, priority);
+  return enqueueSubtitleJob({ ...options, sourceId, requestedAt: Date.now() }, priority);
 }
 
 async function savePendingSubtitle(sourceId) {

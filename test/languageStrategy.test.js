@@ -1,7 +1,15 @@
 const test = require("node:test");
+const { selectTranscriptionAudio } = require("../src/services/languageStrategy");
 const assert = require("node:assert/strict");
+
+test("transcription follows the real dub when the declared original audio is absent", () => {
+  const track = selectTranscriptionAudio([{ ffIndex: 2, lang: "en", title: "English Dub", disposition: { default: true } }], { originalLanguage: "ja" });
+  assert.equal(track.ffIndex, 2);
+  assert.equal(track.lang, "en");
+  assert.equal(track.reason, "original-audio-unavailable");
+});
 const {
-  canonicalLanguage, countryLanguageCandidates, languageMatches, selectOriginalAudio, speechRecognitionLanguage, subtitleLanguageOrder, translationRoute,
+  canonicalLanguage, countryLanguageCandidates, languageMatches, resolveSourceLanguage, selectOriginalAudio, speechRecognitionLanguage, subtitleLanguageOrder, translationRoute,
 } = require("../src/services/languageStrategy");
 
 test("normalizes common two and three-letter language tags", () => {
@@ -10,6 +18,12 @@ test("normalizes common two and three-letter language tags", () => {
   assert.equal(canonicalLanguage("pob"), "pt-br");
   assert.equal(languageMatches("por", "pt-BR"), true);
   assert.equal(speechRecognitionLanguage("pt-BR"), "pt");
+});
+
+test("keeps the confirmed audio language when opening cues confuse text detection", () => {
+  assert.equal(resolveSourceLanguage("en", "ja", { audioTranscription: true }), "ja");
+  assert.equal(resolveSourceLanguage("en", "ja"), "en");
+  assert.equal(resolveSourceLanguage("und", "ja", { audioTranscription: true }), "ja");
 });
 
 test("selects an explicitly original audio instead of a default dub", () => {

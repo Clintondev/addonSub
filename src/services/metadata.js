@@ -27,11 +27,15 @@ function transitionIf(sourceId, stage, patch = {}, predicate = () => true) {
       ? { error: null, extractionError: null }
       : {};
     const normalizedPatch = { ...terminalCleanup, ...patch };
-    const event = { stage, at: new Date().toISOString(), ...normalizedPatch };
+    const now = Date.now();
+    const stageChanged = current.stage !== stage;
+    const stageDurationsMs = { ...current.stageDurationsMs };
+    if (stageChanged && current.stage && current.stageStartedAt) stageDurationsMs[current.stage] = (stageDurationsMs[current.stage] || 0) + Math.max(0, now - Date.parse(current.stageStartedAt));
+    const event = { stage, at: new Date(now).toISOString(), ...normalizedPatch };
     const history = [...(current.history || [])];
     if (current.stage === stage && history.length) history[history.length - 1] = event;
     else history.push(event);
-    const updated = { ...current, sourceId, stage, updatedAt: event.at, ...normalizedPatch, history };
+    const updated = { ...current, sourceId, stage, updatedAt: event.at, ...normalizedPatch, stageStartedAt: stageChanged ? event.at : (current.stageStartedAt || event.at), stageDurationsMs, history: history.slice(-64) };
     writeMeta(sourceId, updated);
     return updated;
   });

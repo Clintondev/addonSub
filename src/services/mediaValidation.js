@@ -1,5 +1,5 @@
 const fs = require("fs");
-const { runProcess } = require("../utils/processRunner");
+const { probeMediaTracks } = require("./ffextract");
 
 function sampleOffsets(size, sampleBytes = 4096) {
   if (size <= sampleBytes) return [0];
@@ -23,12 +23,10 @@ async function validateLocalMedia(file, { probe = true } = {}) {
   if (!stat.isFile() || stat.size < 1024 * 1024) return { valid: false, reason: "Arquivo local está vazio ou incompleto", size: stat.size };
   if (samplesAreAllZero(file, stat.size)) return { valid: false, reason: "Arquivo local contém somente bytes zerados", size: stat.size };
   if (!probe) return { valid: true, size: stat.size };
-  const result = await runProcess("ffprobe", ["-v", "error", "-show_entries", "format=format_name,duration", "-of", "json", file], {
-    timeoutMs: 30000,
-    maxBuffer: 1024 * 1024,
-  });
-  if (result.status !== 0) return { valid: false, reason: `FFprobe rejeitou o arquivo: ${(result.stderr || "formato inválido").trim().slice(0, 1000)}`, size: stat.size };
-  const probeErrors = String(result.stderr || "").trim();
+  let result;
+  try { result = await probeMediaTracks(file); }
+  catch (error) { return { valid: false, reason: `FFprobe rejeitou o arquivo: ${error.message.slice(0, 1000)}`, size: stat.size }; }
+  const probeErrors = result.probeErrors;
   // ffprobe may still exit with status 0 after detecting damaged/truncated
   // Matroska structures. Accepting that output previously published a
   // one-line subtitle from an incomplete PGS stream.
@@ -36,7 +34,7 @@ async function validateLocalMedia(file, { probe = true } = {}) {
     return { valid: false, reason: `FFprobe detectou corrupção: ${probeErrors.slice(0, 1000)}`, size: stat.size };
   }
   try {
-    const format = JSON.parse(result.stdout || "{}").format || {};
+    const format = result.format || {};
     const duration = Number(format.duration);
     if (!format.format_name || !Number.isFinite(duration) || duration <= 0) return { valid: false, reason: "Arquivo não possui formato ou duração válidos", size: stat.size };
     return { valid: true, size: stat.size, duration, format: format.format_name };

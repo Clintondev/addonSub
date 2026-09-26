@@ -1,4 +1,5 @@
 const fs = require("fs");
+const crypto = require("crypto");
 const path = require("path");
 const { execFile, spawn } = require("child_process");
 const config = require("../config");
@@ -9,11 +10,14 @@ const { acquireGpuLock } = require("./gpuLock");
 const { acquireSemaphoreSlot } = require("./distributedSemaphore");
 const { reserveStorage } = require("./storageQuota");
 const { directorySize, invalidateStorageUsage } = require("./storageUsage");
+const { probeMediaTracks } = require("./ffextract");
+const { mediaIdentity } = require("./mediaIdentity");
+const { isCancelled } = require("./cancellationStore");
 
 const active = new Map();
 const starting = new Map();
 let nvencSupport;
-const HLS_CACHE_VERSION = 5;
+const HLS_CACHE_VERSION = 7;
 
 function execFileAsync(command, args, options = {}) {
   return new Promise((resolve, reject) => {
@@ -30,18 +34,14 @@ function outputDir(sourceId) {
   return safeChildPath(config.hlsDir, sourceId);
 }
 
-function outputPath(sourceId, fileName) {
+function outputPath(sourceId, fileName, generation = null) {
+  const metadata = readMetadata(sourceId, generation);
+  if (metadata?.generation) return safeChildPath(config.hlsDir, sourceId, "versions", metadata.generation, fileName);
   return safeChildPath(config.hlsDir, sourceId, fileName);
 }
 
 async function probeMedia(input) {
-  const { stdout } = await execFileAsync("ffprobe", [
-    "-v", "error",
-    "-show_entries", "stream=index,codec_type,codec_name,profile,pix_fmt,channels,disposition:stream_tags=language,title:format=duration",
-    "-of", "json",
-    input,
-  ], { timeout: 30000 });
-  return JSON.parse(stdout);
+  return probeMediaTracks(input);
 }
 
 async function supportsNvenc() {
@@ -87,9 +87,7 @@ function choosePlan(probe, nvencAvailable) {
       language: String(stream.tags?.language || "und").toLowerCase(),
       title: stream.tags?.title || null,
       isDefault: outputIndex === defaultAudioIndex,
-      // Keep the default rendition in-band as a compatibility fallback and
-      // publish only alternate languages as explicit selectable renditions.
-      playlist: outputIndex === defaultAudioIndex ? null : `audio-${outputIndex}.m3u8`,
+      playlist: `audio-${outputIndex}.m3u8`,
     })),
   };
 }
@@ -100,16 +98,13 @@ function subtitleFilterPath(file) {
 
 function buildFfmpegArgs(input, playlist, plan, options = config.hls, subtitleFile = null) {
   const dir = path.dirname(playlist);
-  const segmentPattern = path.join(dir, "segment-%05d.ts");
-  const defaultAudio = (plan.audioTracks || []).find((track) => track.isDefault) || plan.audioTracks?.[0];
+  const segmentPattern = path.join(dir, "video-only-%05d.ts");
   const args = [
     "-hide_banner", "-loglevel", "warning", "-y",
     "-fflags", "+genpts",
     "-i", input,
-    "-map", "0:v:0",
+    "-map", "0:v:0", "-an",
   ];
-  if (defaultAudio) args.push("-map", `0:${defaultAudio.inputIndex}`);
-  else args.push("-an");
   args.push("-sn", "-dn");
 
   if (plan.videoMode === "copy") {
@@ -146,9 +141,6 @@ function buildFfmpegArgs(input, playlist, plan, options = config.hls, subtitleFi
   if (plan.videoMode !== "copy") {
     args.push("-force_key_frames", `expr:gte(t,n_forced*${options.segmentSeconds})`, "-sc_threshold", "0");
   }
-  if (defaultAudio) {
-    args.push("-af", "asetpts=PTS-STARTPTS", "-c:a", "aac", "-b:a", `${options.audioBitrateKbps}k`, "-ac", "2");
-  }
   args.push(
     "-muxpreload", "0", "-muxdelay", "0",
     "-f", "hls", "-hls_time", String(options.segmentSeconds), "-hls_list_size", "0",
@@ -173,34 +165,68 @@ function buildFfmpegArgs(input, playlist, plan, options = config.hls, subtitleFi
 }
 
 function playlistReady(playlist) {
-  if (!fs.existsSync(playlist)) return false;
-  const content = fs.readFileSync(playlist, "utf8");
-  return content.includes("#EXTINF:") && /(?:segment|audio-\d+)-\d{5}\.ts/.test(content);
+  try {
+    const content = fs.readFileSync(playlist, "utf8");
+    return content.includes("#EXTINF:") && /(?:video-only|audio-\d+)-\d{5}\.ts/.test(content);
+  } catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 function playlistComplete(playlist) {
-  return playlistReady(playlist) && fs.readFileSync(playlist, "utf8").includes("#EXT-X-ENDLIST");
+  try {
+    const content = fs.readFileSync(playlist, "utf8");
+    return content.includes("#EXTINF:") && /(?:video-only|audio-\d+)-\d{5}\.ts/.test(content)
+      && content.includes("#EXT-X-ENDLIST");
+  } catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function finalizeVodPlaylist(playlist) {
+  const content = fs.readFileSync(playlist, "utf8");
+  if (!content.includes("#EXT-X-ENDLIST")) throw new Error("A playlist HLS ainda não está completa");
+  if (content.includes("#EXT-X-PLAYLIST-TYPE:VOD")) return;
+  if (!content.includes("#EXT-X-PLAYLIST-TYPE:EVENT")) throw new Error("Tipo de playlist HLS inesperado");
+  const temporary = `${playlist}.${process.pid}.${Date.now()}.vod.tmp`;
+  try {
+    fs.writeFileSync(temporary, content.replace("#EXT-X-PLAYLIST-TYPE:EVENT", "#EXT-X-PLAYLIST-TYPE:VOD"));
+    fs.renameSync(temporary, playlist);
+  } finally {
+    fs.rmSync(temporary, { force: true });
+  }
+}
+
+function finalizeVodPlaylists(sourceId, plan, directory = null) {
+  const file = (name) => directory ? path.join(directory, name) : outputPath(sourceId, name);
+  const playlists = [file("video-only.m3u8"),
+    ...(plan.audioTracks || []).filter((track) => track.playlist).map((track) => file(track.playlist))];
+  playlists.forEach(finalizeVodPlaylist);
 }
 
 function metadataPath(sourceId) {
-  return outputPath(sourceId, "stream-info.json");
+  return safeChildPath(config.hlsDir, sourceId, "stream-info.json");
 }
 
 function inputFingerprint(input, subtitleFile = null) {
-  const identity = (file) => {
-    const stat = fs.statSync(file);
-    return { path: path.resolve(file), size: stat.size, mtimeMs: Math.trunc(stat.mtimeMs) };
-  };
-  return stableHash(JSON.stringify({ input: identity(input), subtitle: subtitleFile ? identity(subtitleFile) : null }), 48);
+  const { segmentSeconds, videoBitrateKbps, audioBitrateKbps, maxHeight } = config.hls;
+  return stableHash(JSON.stringify({ input: mediaIdentity(input), subtitle: subtitleFile ? mediaIdentity(subtitleFile) : null, version: HLS_CACHE_VERSION, encoding: { segmentSeconds, videoBitrateKbps, audioBitrateKbps, maxHeight } }), 48);
 }
 
-function writeMetadata(sourceId, plan, fingerprint, outputBytes = 0) {
-  writeJsonFileAtomic(metadataPath(sourceId), { version: HLS_CACHE_VERSION, fingerprint, plan, outputBytes });
+function writeMetadata(sourceId, plan, fingerprint, outputBytes = 0, generation = null, totalOutputBytes = outputBytes) {
+  const metadata = { version: HLS_CACHE_VERSION, fingerprint, plan, outputBytes, totalOutputBytes, generation };
+  if (generation) writeJsonFileAtomic(safeChildPath(config.hlsDir, sourceId, "versions", generation, "stream-info.json"), metadata);
+  writeJsonFileAtomic(metadataPath(sourceId), metadata);
 }
 
-function readMetadata(sourceId) {
+function readMetadata(sourceId, generation = null) {
   try {
-    const metadata = JSON.parse(fs.readFileSync(metadataPath(sourceId), "utf8"));
+    if (generation && !/^[a-f0-9]{48}-[a-f0-9]{16}$/.test(String(generation))) return null;
+    const file = generation ? safeChildPath(config.hlsDir, sourceId, "versions", generation, "stream-info.json") : metadataPath(sourceId);
+    const metadata = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (metadata.generation && !/^[a-f0-9]{48}-[a-f0-9]{16}$/.test(metadata.generation)) return null;
     return metadata.version === HLS_CACHE_VERSION ? metadata : null;
   } catch (_) {
     return null;
@@ -210,19 +236,26 @@ function readMetadata(sourceId) {
 function cacheComplete(sourceId, fingerprint = null) {
   const metadata = readMetadata(sourceId);
   if (fingerprint && metadata?.fingerprint !== fingerprint) return null;
-  if (!metadata || !playlistComplete(outputPath(sourceId, "video.m3u8"))) return null;
+  if (!metadata || !metadata.outputBytes || !playlistComplete(outputPath(sourceId, "video-only.m3u8"))) return null;
   if ((metadata.plan.audioTracks || []).filter((track) => track.playlist).some((track) => !playlistComplete(outputPath(sourceId, track.playlist)))) return null;
   return metadata;
 }
 
-function waitForPlaylist(playlist, child, timeoutMs) {
+function conversionRunning(sourceId) {
+  if (active.has(sourceId) || starting.has(sourceId)) return true;
+  try { return Date.now() - fs.statSync(safeChildPath(outputDir(sourceId), "preparing.json")).mtimeMs < 45000; }
+  catch (_) { return false; }
+}
+
+function waitForPlaylist(playlist, child, timeoutMs, completedPlaylist = () => null) {
   return new Promise((resolve, reject) => {
     const started = Date.now();
     const timer = setInterval(() => {
-      if (playlistReady(playlist)) {
+      const completed = completedPlaylist();
+      if (completed || playlistReady(playlist)) {
         clearInterval(timer);
-        resolve(playlist);
-      } else if (child.exitCode !== null) {
+        resolve(completed || playlist);
+      } else if (child.exitCode !== null && child.exitCode !== 0) {
         clearInterval(timer);
         reject(new Error("A conversão HLS terminou antes de produzir segmentos"));
       } else if (Date.now() - started >= timeoutMs) {
@@ -233,21 +266,35 @@ function waitForPlaylist(playlist, child, timeoutMs) {
   });
 }
 
-async function startHls(sourceId, input, { subtitleFile = null, fingerprint = inputFingerprint(input, subtitleFile) } = {}) {
+async function startHls(sourceId, input, { subtitleFile = null, fingerprint = inputFingerprint(input, subtitleFile), priority = 5, requestedAt = Date.now(), assertActive } = {}) {
+  const releaseSource = await acquireSemaphoreSlot(`hls-source-${sourceId}`, 1, { owner: `hls:${sourceId}`, leaseMs: config.storageReservationLeaseMs });
   let releaseSlot;
   try {
     releaseSlot = await acquireSemaphoreSlot("hls", config.hls.maxConcurrent, { owner: `hls:${sourceId}`, leaseMs: config.storageReservationLeaseMs });
   } catch (_) {
+    await releaseSource();
     throw new Error("Conversor HLS ocupado; tente novamente em instantes");
   }
-  const dir = outputDir(sourceId);
-  const playlist = outputPath(sourceId, "video.m3u8");
+  const generation = `${fingerprint}-${crypto.randomBytes(8).toString("hex")}`;
+  const dir = safeChildPath(outputDir(sourceId), "staging", generation);
+  const versionDir = safeChildPath(outputDir(sourceId), "versions", generation);
+  const playlist = path.join(dir, "video-only.m3u8");
+  const startedAt = requestedAt;
+  const preparingMarker = safeChildPath(outputDir(sourceId), "preparing.json");
+  let lastHeartbeat = 0;
+  const heartbeat = () => { assertActive?.(); writeJsonFileAtomic(preparingMarker, { generation, fingerprint, at: Date.now() }); lastHeartbeat = Date.now(); };
+  const cleanup = () => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    try { if (JSON.parse(fs.readFileSync(preparingMarker, "utf8")).generation === generation) fs.rmSync(preparingMarker, { force: true }); } catch (_) {}
+    invalidateStorageUsage();
+  };
   let releaseStorage = null;
   let releaseGpu = null;
   let child;
   let plan;
   try {
-    const previousBytes = readMetadata(sourceId)?.outputBytes || 0;
+    assertActive?.();
+    heartbeat();
     const probe = await probeMedia(input);
     const durationSeconds = Number(probe.format?.duration || 0);
     const audioCount = (probe.streams || []).filter((stream) => stream.codec_type === "audio").length;
@@ -255,7 +302,7 @@ async function startHls(sourceId, input, { subtitleFile = null, fingerprint = in
       ? Math.ceil(durationSeconds * (config.hls.videoBitrateKbps + audioCount * config.hls.audioBitrateKbps) * 1000 / 8 * 1.08)
       : 0;
     const outputEstimate = Math.max(fs.statSync(input).size, bitrateEstimate);
-    releaseStorage = await reserveStorage(Math.max(0, outputEstimate - previousBytes), `hls:${sourceId}`);
+    releaseStorage = await reserveStorage(outputEstimate, `hls:${sourceId}`);
     const nvencAvailable = await supportsNvenc();
     plan = choosePlan(probe, nvencAvailable);
     if (subtitleFile) {
@@ -263,30 +310,43 @@ async function startHls(sourceId, input, { subtitleFile = null, fingerprint = in
       plan.subtitleBurnedIn = true;
     }
     releaseGpu = plan.videoMode === "nvenc"
-      ? await acquireGpuLock(`hls:${sourceId}`, { waitMs: config.hls.startTimeoutMs })
+      ? await acquireGpuLock(`hls:${sourceId}`, { waitMs: config.hls.startTimeoutMs, priority })
       : null;
-    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+    if (isCancelled(sourceId, startedAt)) throw new Error("Preparação WEB cancelada");
+    assertActive?.();
     fs.mkdirSync(dir, { recursive: true });
     const args = buildFfmpegArgs(input, playlist, plan, config.hls, subtitleFile);
-    writeMetadata(sourceId, plan, fingerprint);
     logger.info("Iniciando stream HLS", { sourceId, ...plan });
     child = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
   } catch (error) {
+    try { cleanup(); } catch (_) {}
     await releaseGpu?.();
     await releaseStorage?.();
     await releaseSlot();
+    await releaseSource();
     throw error;
   }
   let stderr = "";
   child.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-12000); });
+  const cancellationTimer = setInterval(() => {
+    if (isCancelled(sourceId, startedAt)) child.kill("SIGTERM");
+    try {
+      assertActive?.(); releaseGpu?.assertOwned(); releaseSource.assertOwned(); releaseSlot.assertOwned();
+      if (Date.now() - lastHeartbeat >= 10000) heartbeat();
+    } catch (_) { child.kill("SIGTERM"); }
+  }, 1000);
+  cancellationTimer.unref();
 
   let resourcesReleased = false;
   const releaseResources = async () => {
     if (resourcesReleased) return;
     resourcesReleased = true;
+    clearInterval(cancellationTimer);
+    try { cleanup(); } catch (error) { logger.warn("Falha ao limpar conversão WEB temporária", { sourceId, error: error.message }); }
     await releaseGpu?.();
     await releaseStorage?.();
     await releaseSlot();
+    await releaseSource();
   };
 
   const done = new Promise((resolve, reject) => {
@@ -296,46 +356,75 @@ async function startHls(sourceId, input, { subtitleFile = null, fingerprint = in
       reject(error);
     });
     child.once("exit", async (code) => {
-      active.delete(sourceId);
       if (code === 0) {
         try {
+          releaseGpu?.assertOwned();
+          releaseSource.assertOwned();
+          releaseSlot.assertOwned();
+          if (isCancelled(sourceId, startedAt)) throw new Error("Preparação WEB cancelada");
+          assertActive?.();
+          finalizeVodPlaylists(sourceId, plan, dir);
+          const outputProbe = await probeMedia(path.join(dir, "video-only-00000.ts"));
+          const video = outputProbe.streams?.find((stream) => stream.codec_type === "video");
+          const profile = String(video?.profile || "").toLowerCase();
+          const profileHex = profile.includes("baseline") ? "42e0" : profile.includes("main") ? "4d00" : "6400";
+          const levelHex = Number.isInteger(video?.level) ? video.level.toString(16).padStart(2, "0") : "28";
+          plan.codecs = `avc1.${profileHex}${levelHex}${plan.audioTracks.length ? ",mp4a.40.2" : ""}`;
           const outputBytes = await directorySize(dir);
-          writeMetadata(sourceId, plan, fingerprint, outputBytes);
+          fs.mkdirSync(path.dirname(versionDir), { recursive: true });
+          fs.renameSync(dir, versionDir);
+          const versions = fs.readdirSync(path.dirname(versionDir)).filter((name) => /^[a-f0-9]{48}-[a-f0-9]{16}$/.test(name))
+            .sort((left, right) => fs.statSync(path.join(path.dirname(versionDir), right)).mtimeMs - fs.statSync(path.join(path.dirname(versionDir), left)).mtimeMs);
+          for (const stale of versions.filter((name) => name !== generation).slice(2)) fs.rmSync(safeChildPath(path.dirname(versionDir), stale), { recursive: true, force: true });
+          writeMetadata(sourceId, plan, fingerprint, outputBytes, generation, await directorySize(outputDir(sourceId)));
           invalidateStorageUsage();
           logger.info("Stream HLS concluído", { sourceId, playlist, outputBytes });
           await releaseResources();
-          resolve(playlist);
+          active.delete(sourceId);
+          resolve(path.join(versionDir, "video-only.m3u8"));
         } catch (error) {
           await releaseResources();
+          active.delete(sourceId);
           reject(error);
         }
       } else {
         const error = new Error(`FFmpeg HLS encerrou com código ${code}: ${stderr.trim().slice(-1000)}`);
         logger.error("Falha no stream HLS", { sourceId, error: error.message });
         await releaseResources();
+        active.delete(sourceId);
         reject(error);
       }
     });
   });
   done.catch(() => {});
-  const requiredPlaylists = [playlist, ...(plan.audioTracks || []).filter((track) => track.playlist).map((track) => outputPath(sourceId, track.playlist))];
-  const ready = Promise.all(requiredPlaylists.map((file) => waitForPlaylist(file, child, config.hls.startTimeoutMs)))
+  const requiredPlaylists = [playlist, ...(plan.audioTracks || []).filter((track) => track.playlist).map((track) => path.join(dir, track.playlist))];
+  const ready = Promise.all(requiredPlaylists.map((file) => waitForPlaylist(file, child, config.hls.startTimeoutMs, () => cacheComplete(sourceId, fingerprint) ? outputPath(sourceId, path.basename(file)) : null)))
     .then(() => ({ playlist, plan }));
-  active.set(sourceId, { child, ready, done, plan });
+  active.set(sourceId, { child, ready, done, plan, fingerprint });
   return ready;
 }
 
-async function ensureHls(sourceId, input, { subtitleFile = null } = {}) {
+async function ensureHls(sourceId, input, { subtitleFile = null, priority = 5, requestedAt = Date.now(), assertActive } = {}) {
+  assertActive?.();
   const fingerprint = inputFingerprint(input, subtitleFile);
   const cached = cacheComplete(sourceId, fingerprint);
-  if (cached) return { playlist: outputPath(sourceId, "video.m3u8"), plan: cached.plan };
+  if (cached) return { playlist: outputPath(sourceId, "video-only.m3u8"), plan: cached.plan };
   const running = active.get(sourceId);
-  if (running) return running.ready;
+  if (running) {
+    if (running.fingerprint !== fingerprint) { await running.done; return ensureHls(sourceId, input, { subtitleFile, priority, requestedAt, assertActive }); }
+    return running.ready;
+  }
   const pending = starting.get(sourceId);
-  if (pending) return pending;
-  const start = startHls(sourceId, input, { subtitleFile, fingerprint }).finally(() => starting.delete(sourceId));
+  if (pending) { await pending; return ensureHls(sourceId, input, { subtitleFile, priority, requestedAt, assertActive }); }
+  const start = startHls(sourceId, input, { subtitleFile, fingerprint, priority, requestedAt, assertActive }).finally(() => starting.delete(sourceId));
   starting.set(sourceId, start);
   return start;
+}
+
+async function waitForHlsCompletion(sourceId) {
+  if (starting.has(sourceId)) await starting.get(sourceId);
+  if (active.has(sourceId)) await active.get(sourceId).done;
+  if (!cacheComplete(sourceId)) throw new Error("HLS não concluiu uma publicação válida");
 }
 
 async function cancelHls(sourceId) {
@@ -354,7 +443,7 @@ function pruneHlsCache(now = Date.now()) {
   fs.mkdirSync(config.hlsDir, { recursive: true });
   const cutoff = now - config.hls.cacheMaxAgeMs;
   for (const entry of fs.readdirSync(config.hlsDir, { withFileTypes: true })) {
-    if (!entry.isDirectory() || active.has(entry.name)) continue;
+    if (!entry.isDirectory() || conversionRunning(entry.name)) continue;
     const dir = outputDir(entry.name);
     if (fs.statSync(dir).mtimeMs < cutoff) {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -365,7 +454,7 @@ function pruneHlsCache(now = Date.now()) {
 
 function storageBytes(sourceId) {
   const metadata = readMetadata(sourceId);
-  return Number(metadata?.outputBytes || 0);
+  return Number(metadata?.totalOutputBytes || metadata?.outputBytes || 0);
 }
 
 let pruneTimer;
@@ -381,11 +470,15 @@ function scheduleHlsCachePruning() {
 }
 
 module.exports = {
+  waitForHlsCompletion,
+  readMetadata,
   buildFfmpegArgs,
   cacheComplete,
   cancelHls,
   choosePlan,
+  conversionRunning,
   ensureHls,
+  finalizeVodPlaylist,
   HLS_CACHE_VERSION,
   inputFingerprint,
   outputPath,

@@ -1,7 +1,10 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const http = require("node:http");
-const { containsProtectedTerm, contextualChunks, inferProtectedTerms, looksRomanizedJapanese, normalizeOcrSourceText, normalizeSourceForTranslation, parseTaggedTranslations, preserveProtectedTermsFromDraft, translateContextualChunk, translateGemmaChunkResilient, validateContextualTranslations, validateSemanticFidelity } = require("../src/services/translate");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { containsProtectedTerm, contextualChunks, inferProtectedTerms, looksRomanizedJapanese, normalizeOcrSourceText, normalizeSourceForTranslation, parseTaggedTranslations, preserveProtectedTermsFromDraft, translateContextual, translateContextualChunk, translateGemmaChunkResilient, validateContextualTranslations, validateSemanticFidelity, validateTargetScript } = require("../src/services/translate");
 
 test("contextual chunks preserve stable cue ids and original indexes", () => {
   const chunks = contextualChunks(["First line", "Second line", "Third line"], 1000, 2);
@@ -29,13 +32,23 @@ test("contextual validation restores source order even if model reorders JSON", 
   assert.deepEqual(output, ["Como você está?", "Saia."]);
 });
 
+test("contextual validation removes leaked prompt and formatting tags, including cached translations", () => {
+  const chunk = contextualChunks(["Line one", "Line two"], 1000, 20)[0];
+  const output = validateContextualTranslations(chunk, [
+    { id: "cue-000000", text: "Primeira linha.</span></pt>" },
+    { id: "cue-000001", text: "Segunda linha.</previous></code>" },
+  ]);
+  assert.deepEqual(output, ["Primeira linha.", "Segunda linha."]);
+  assert.throws(() => validateTargetScript(["Texto.</unrecognized>"], "pt-BR"), /marcação indevida/);
+});
+
 test("contextual validation rejects omitted, empty, and duplicated cues", () => {
   const chunk = contextualChunks(["First", "Second"], 1000, 20)[0];
   assert.throws(() => validateContextualTranslations(chunk, [{ id: "cue-000000", text: "Primeira" }]), /quantidade/);
   assert.throws(() => validateContextualTranslations(chunk, [
     { id: "cue-000000", text: "Primeira" },
     { id: "cue-000000", text: "Duplicada" },
-  ]), /ausente/);
+  ]), /duplicado/);
 });
 
 test("TranslateGemma tagged output preserves ids and decodes subtitle text", () => {
@@ -156,7 +169,7 @@ test("TranslateGemma repairs only a persistently rejected subtitle line", async 
     retries: 0,
   });
   assert.deepEqual(output, ["Bem-vindos à Fairy Tail.", "Vamos começar."]);
-  assert.equal(calls, 4);
+  assert.equal(calls, 3);
 });
 
 test("TranslateGemma protects names with immutable tokens and restores them", async (t) => {
@@ -202,7 +215,153 @@ test("semantic review keeps the faithful draft only for lines where it drops a n
   ), ["Pode ter sua própria Fairy Tail.", "Não acredito!"]);
 });
 
+test("PT-BR rejects names left in a non-Latin script but accepts romanized names", () => {
+  const chunk = contextualChunks(["シャルルはどこ?"], 1000, 20)[0];
+  assert.throws(() => validateSemanticFidelity(chunk, ["Onde está シャルル?"], [], "pt-BR"), /escrita não latina em cue-000000/);
+  assert.deepEqual(validateSemanticFidelity(chunk, ["Onde está Charle?"], [], "pt-BR"), ["Onde está Charle?"]);
+  assert.throws(() => validateTargetScript(["Eu vou proteger a ウェンディー."], "pt-BR"), /escrita não latina/);
+  assert.doesNotThrow(() => validateTargetScript(["Onde está シャルル?"], "ja"));
+});
+
+test("a reviewed name in Latin script is not replaced by a source-script draft", () => {
+  const chunk = contextualChunks(["Fairy Tail e シャルル"], 1000, 20)[0];
+  assert.deepEqual(preserveProtectedTermsFromDraft(
+    chunk,
+    ["Fairy Tail e シャルル"],
+    ["A guilda e Charle"],
+    ["Fairy Tail"],
+  ), ["A guilda e Charle"]);
+});
+
+test("TranslateGemma repairs a Japanese name left in a PT-BR subtitle", async (t) => {
+  let calls = 0;
+  const server = http.createServer((request, response) => {
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (part) => { body += part; });
+    request.on("end", () => {
+      calls += 1;
+      const prompt = JSON.parse(body).messages[0].content;
+      assert.match(prompt, /established Latin-script spelling/);
+      if (calls === 4) {
+        assert.match(prompt, /Correct this rejected translation/);
+        assert.doesNotMatch(prompt, /Draft to review:/);
+      }
+      const name = calls < 4 ? "シャルル" : "Charle";
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ message: { content: `<sub id="cue-000000">Onde está ${name}?</sub>` } }));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const chunk = contextualChunks(["シャルルはどこ?"], 1000, 20)[0];
+  const output = await translateContextualChunk(chunk, {
+    endpoint: `http://127.0.0.1:${server.address().port}`,
+    model: "translategemma:test",
+    sourceLang: "ja",
+    targetLocale: "pt-BR",
+    timeoutMs: 2000,
+    retries: 0,
+  });
+  assert.deepEqual(output, ["Onde está Charle?"]);
+  assert.equal(calls, 4);
+});
+
+test("confirmed title spelling repairs a model response that still copies Kana", async (t) => {
+  let calls = 0;
+  const server = http.createServer((request, response) => {
+    request.resume();
+    request.on("end", () => {
+      calls++;
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ message: { content: '<sub id="cue-000000">Onde está シャルル?</sub>' } }));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const chunk = contextualChunks(["Charleはどこ?"], 1000, 20)[0];
+  const result = await translateContextualChunk(chunk, {
+    endpoint: `http://127.0.0.1:${server.address().port}`,
+    model: "translategemma:test",
+    sourceLang: "ja",
+    targetLocale: "pt-BR",
+    nameAliases: { "シャルル": "Charle" },
+    timeoutMs: 2000,
+    retries: 0,
+  });
+  assert.deepEqual(result, ["Onde está Charle?"]);
+  assert.equal(calls, 2);
+});
+
+test("later translation chunks see the approved spelling despite a Kana recognition variant", async (t) => {
+  let priorNameSeen = false;
+  const server = http.createServer((request, response) => {
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (part) => { body += part; });
+    request.on("end", () => {
+      const prompt = JSON.parse(body).messages[0].content;
+      const id = /<sub id="([^"]+)">/.exec(prompt)[1];
+      if (id === "cue-000001" && prompt.includes("<previous><source>シャルル!</source><pt>Charle!</pt></previous>")) priorNameSeen = true;
+      const text = id === "cue-000000" ? "Charle!" : "Onde está Charle?";
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ message: { content: `<sub id="${id}">${text}</sub>` } }));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const output = await translateContextual(["シャルル!", "シャレルはどこ?"], {
+    endpoint: `http://127.0.0.1:${server.address().port}`,
+    model: "translategemma:test",
+    sourceLang: "ja",
+    targetLocale: "pt-BR",
+    maxChars: 1000,
+    maxCues: 1,
+    timeoutMs: 2000,
+    retries: 0,
+  });
+  assert.deepEqual(output, ["Charle!", "Onde está Charle?"]);
+  assert.equal(priorNameSeen, true);
+});
+
+test("a verified translation block is reused on retry of the same source", async (t) => {
+  let calls = 0;
+  const server = http.createServer((request, response) => {
+    request.resume();
+    request.on("end", () => {
+      calls++;
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ message: { content: '<sub id="cue-000000">Olá, Charle!</sub>' } }));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "translation-cache-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const options = {
+    endpoint: `http://127.0.0.1:${server.address().port}`,
+    model: "translategemma:test",
+    sourceLang: "ja",
+    targetLocale: "pt-BR",
+    cachePath: path.join(dir, "blocks.json"),
+    timeoutMs: 2000,
+    retries: 0,
+  };
+  assert.deepEqual(await translateContextual(["こんにちは、シャルル!"], options), ["Olá, Charle!"]);
+  assert.deepEqual(await translateContextual(["こんにちは、シャルル!"], options), ["Olá, Charle!"]);
+  assert.equal(calls, 2);
+});
+
+test("numeric fidelity accepts a Portuguese word for a Japanese digit", () => {
+  const chunk = contextualChunks(["どういうことだ 2人だけだと"], 1000, 20)[0];
+  assert.deepEqual(validateSemanticFidelity(chunk, ["Como assim, só duas pessoas?"], [], "pt-BR"), ["Como assim, só duas pessoas?"]);
+  assert.throws(() => validateSemanticFidelity(chunk, ["Como assim, só três pessoas?"], [], "pt-BR"), /alterou o número 2/);
+});
+
 test("known ambiguous subtitle idioms are expanded before translation", () => {
+  assert.equal(normalizeSourceForTranslation("Hell if I know!"), "I have absolutely no idea!");
   assert.equal(normalizeSourceForTranslation("Do my time and get out."), "serve my prison sentence and get out.");
   assert.equal(normalizeSourceForTranslation("Ain't nobody gonna serve it for you."), "Ain't nobody gonna serve your prison sentence for you.");
   assert.equal(normalizeSourceForTranslation("You talking out the side of your neck?"), "Are you talking nonsense and being disrespectful?");
@@ -217,6 +376,7 @@ test("separates romanized Japanese song lines from English dialogue", () => {
   assert.equal(looksRomanizedJapanese("anata no ude ga ima koishii to omou"), true);
   assert.equal(looksRomanizedJapanese("kyou no sora wa aoku sumi watatte ite"), true);
   assert.equal(looksRomanizedJapanese("I want to be in your arms right now"), false);
+  assert.equal(looksRomanizedJapanese("Kara and Sora went to the library."), false);
   const chunks = contextualChunks([
     { text: "Where are you going?", sourceLang: "en" },
     { text: "anata no ude ga ima koishii to omou", sourceLang: "ja-Latn" },
@@ -235,6 +395,12 @@ test("protects repeated names and rejects objective semantic corruption", () => 
   assert.throws(() => validateSemanticFidelity(chunk, ["Garoto Bonitão tem 100 soldados.", "Diga ao Sugarboy para esperar."], terms), /nome protegido/);
   assert.throws(() => validateSemanticFidelity(chunk, ["Sugarboy tem 10 soldados.", "Diga ao Sugarboy para esperar."], terms), /alterou o número/);
   assert.throws(() => validateSemanticFidelity(chunk, ["Sugarboy tem 100 soldados |", "Diga ao Sugarboy para esperar."], terms), /resíduo de OCR/);
+});
+
+test("accepts a faithful natural translation of Japanese numeric fractions", () => {
+  const chunk = [{ id: "cue-000203", text: "3分の1を残して北に向かう!" }];
+  assert.deepEqual(validateSemanticFidelity(chunk, ["Deixem um terço aqui e sigam para o norte!"]), ["Deixem um terço aqui e sigam para o norte!"]);
+  assert.throws(() => validateSemanticFidelity(chunk, ["Deixem metade aqui e sigam para o norte!"]), /alterou uma fração/);
 });
 
 test("matches protected names as complete terms instead of substrings", () => {
@@ -280,4 +446,133 @@ test("does not infer repeated sentence-opening interjections as names", () => {
   const terms = inferProtectedTerms(chunk);
   assert.equal(terms.includes("Hey"), false);
   assert.equal(terms.includes("Natsu"), true);
+});
+
+test("TranslateGemma removes invented XML elements without dropping their visible text", () => {
+  const chunk = contextualChunks(["Come here."], 1000, 20)[0];
+  assert.deepEqual(parseTaggedTranslations(chunk, '<sub id="cue-000000">Venha <place>aqui</place>.</sub>'), ["Venha aqui."]);
+});
+
+test("multiple referents do not trigger an unreliable pronoun regex veto", () => {
+  const chunk = contextualChunks([{ text: "She took the king's book.", sourceLang: "en" }], 1000, 20)[0];
+  assert.deepEqual(validateSemanticFidelity(chunk, ["Ela pegou o livro dele."], [], "pt-BR"), ["Ela pegou o livro dele."]);
+});
+
+test("semantic review rejects invalid Portuguese da mim or do mim", () => {
+  const chunk = contextualChunks(["Take it from me."], 1000, 20)[0];
+  assert.throws(() => validateSemanticFidelity(chunk, ["Tire isso da mim."], [], "pt-BR"), /regência inválida/);
+});
+
+test("inferred capitalized words are not frozen as names in English dialogue", async (t) => {
+  let receivedPrompt = "";
+  const server = http.createServer((request, response) => {
+    let body = "";
+    request.on("data", (part) => { body += part; });
+    request.on("end", () => {
+      receivedPrompt = JSON.parse(body).messages[0].content;
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ message: { content: '<sub id="cue-000000">Sim, Vossa Majestade. Inicie o Código ETD. Os Dragon Slayers estão aqui.</sub>' } }));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const chunk = contextualChunks(["Yes, Your Majesty. Initiate Code ETD. Dragon Slayers are here."], 1000, 20)[0];
+  const output = await translateGemmaChunkResilient(chunk, {
+    endpoint: `http://127.0.0.1:${server.address().port}`,
+    model: "translategemma:test",
+    sourceLang: "en",
+    targetLocale: "pt-BR",
+    protectedTerms: ["Majesty", "Code", "Dragon", "Slayers", "ETD"],
+    timeoutMs: 2000,
+    retries: 0,
+  });
+  assert.doesNotMatch(receivedPrompt, /ZXQKEEP/);
+  assert.deepEqual(output, ["Sim, Vossa Majestade. Inicie o Código ETD. Os Dragon Slayers estão aqui."]);
+});
+
+test("a verified block can be reused after switching to a smaller translation model", async (t) => {
+  let calls = 0;
+  const server = http.createServer((request, response) => {
+    request.resume();
+    request.on("end", () => {
+      calls++;
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ message: { content: '<sub id="cue-000000">Olá, Charle!</sub>' } }));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "translation-cache-model-switch-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const base = { endpoint: `http://127.0.0.1:${server.address().port}`, sourceLang: "ja", targetLocale: "pt-BR", cachePath: path.join(dir, "blocks.json"), timeoutMs: 2000, retries: 0 };
+  assert.deepEqual(await translateContextual(["こんにちは、シャルル!"], { ...base, model: "translategemma:large" }), ["Olá, Charle!"]);
+  assert.deepEqual(await translateContextual(["こんにちは、シャルル!"], { ...base, model: "translategemma:small", cacheModels: ["translategemma:large"] }), ["Olá, Charle!"]);
+  assert.equal(calls, 2);
+});
+
+test("contextual translation falls back once and keeps using the CPU-safe model", async (t) => {
+  let primaryCalls = 0;
+  let fallbackCalls = 0;
+  const server = http.createServer((request, response) => {
+    let body = "";
+    request.on("data", (part) => { body += part; });
+    request.on("end", () => {
+      const payload = JSON.parse(body);
+      if (payload.model === "translategemma:large") {
+        primaryCalls++;
+        response.writeHead(500, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: "model cannot be allocated" }));
+        return;
+      }
+      fallbackCalls++;
+      const id = /<sub id="([^"]+)">/.exec(payload.messages[0].content)?.[1] || "cue-000000";
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ message: { content: `<sub id="${id}">Tradução segura.</sub>` } }));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const output = await translateContextual(["Safe translation."], {
+    endpoint: `http://127.0.0.1:${server.address().port}`,
+    model: "translategemma:large",
+    gpuLayers: 999,
+    fallbackModel: "translategemma:small",
+    fallbackGpuLayers: 0,
+    sourceLang: "en",
+    targetLocale: "pt-BR",
+    timeoutMs: 2000,
+    retries: 2,
+  });
+  assert.deepEqual(output, ["Tradução segura."]);
+  assert.equal(primaryCalls, 2);
+  assert.equal(fallbackCalls, 2);
+});
+
+
+test("an exact series correction bypasses an empty model repair", async () => {
+  const chunk = contextualChunks([{ text: "And Mystogan sent Gajeel here.", sourceLang: "en" }], 1000, 20)[0];
+  const output = await translateContextualChunk(chunk, {
+    endpoint: "http://127.0.0.1:1",
+    model: "translategemma:4b",
+    sourceLang: "en",
+    targetLocale: "pt-BR",
+    seriesCorrections: [{ source: "And Mystogan sent Gajeel here.", target: "E Mystogan enviou Gajeel para cá." }],
+    timeoutMs: 20,
+    retries: 0,
+  });
+  assert.deepEqual(output, ["E Mystogan enviou Gajeel para cá."]);
+});
+
+test("a nested resilient split also bypasses the model for an exact correction", async () => {
+  const chunk = contextualChunks([{ text: "And Mystogan sent Gajeel here.", sourceLang: "en" }], 1000, 20)[0];
+  const output = await translateGemmaChunkResilient(chunk, {
+    endpoint: "http://127.0.0.1:1",
+    model: "translategemma:4b",
+    sourceLang: "en",
+    targetLocale: "pt-BR",
+    seriesCorrections: [{ source: "And Mystogan sent Gajeel here.", target: "E Mystogan enviou Gajeel para cá." }],
+    timeoutMs: 20,
+    retries: 0,
+  }, 3);
+  assert.deepEqual(output, ["E Mystogan enviou Gajeel para cá."]);
 });

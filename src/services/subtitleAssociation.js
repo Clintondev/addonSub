@@ -1,10 +1,10 @@
 const fs = require("fs");
 const path = require("path");
 const sourceStore = require("./sourceStore");
-const { subtitlePath, translationStatus } = require("./subtitleService");
+const { translationStatus } = require("./subtitleService");
 
 function hasReadySubtitle(record) {
-  return Boolean(record && fs.existsSync(subtitlePath(record.sourceId, "pt-BR.vtt")));
+  return Boolean(record && translationStatus(record.sourceId).status === "ready");
 }
 
 function sameLocalMedia(left, right) {
@@ -18,7 +18,7 @@ function subtitleOwner(record) {
   if (!record || hasReadySubtitle(record)) return record || null;
   if (!record.localPath || !fs.existsSync(record.localPath)) return record;
   return sourceStore.list({ videoId: record.videoId, limit: 500 })
-    .find((candidate) => hasReadySubtitle(candidate) && sameLocalMedia(record, candidate)) || record;
+    .find((candidate) => sameLocalMedia(record, candidate) && hasReadySubtitle(candidate)) || record;
 }
 
 function associatedTranslationStatus(record) {

@@ -6,7 +6,8 @@ const watchStore = require("./watchStore");
 const { parseVideoId } = require("./videoId");
 const { readMeta } = require("./metadata");
 const { translationStatus } = require("./subtitleService");
-const { cancelHls, storageBytes: hlsStorageBytes } = require("./hlsPlayback");
+const { associatedTranslationStatus } = require("./subtitleAssociation");
+const { cacheComplete: hlsCacheComplete, cancelHls, conversionRunning: hlsConversionRunning, inputFingerprint: hlsInputFingerprint, storageBytes: hlsStorageBytes } = require("./hlsPlayback");
 const { cancelEmbeddedPlayback, storageBytes: playbackStorageBytes } = require("./embeddedPlayback");
 const { invalidateStorageUsage } = require("./storageUsage");
 const { request } = require("./qbittorrent");
@@ -31,6 +32,16 @@ function episodeView(source) {
   const status = translationStatus(source.sourceId);
   const subtitlesDir = safeChildPath(config.storageDir, "subtitles", source.sourceId);
   const mediaReady = Boolean(source.localPath && existsSize(source.localPath));
+  let webStatus = "unavailable";
+  if (mediaReady) {
+    const webSubtitle = associatedTranslationStatus(source);
+    const webSourceId = webSubtitle.associated ? webSubtitle.subtitleSourceId : source.sourceId;
+    try {
+      const subtitleFile = webSubtitle.assPath || webSubtitle.srtPath || null;
+      webStatus = hlsCacheComplete(webSourceId, hlsInputFingerprint(source.localPath, subtitleFile))
+        ? "ready" : hlsConversionRunning(webSourceId) ? "converting" : "not-ready";
+    } catch (_) { webStatus = "not-ready"; }
+  }
   const downloadProgress = meta.downloadProgress ?? (mediaReady ? 100 : 0);
   const downloadStatus = mediaReady ? "ready"
     : meta.stage === "acquiring" ? "downloading"
@@ -56,6 +67,7 @@ function episodeView(source) {
       speedBytes: meta.downloadSpeedBytes || 0,
       etaSeconds: Number.isFinite(meta.etaSeconds) ? meta.etaSeconds : null,
     },
+    web: { status: webStatus },
     error: meta.error || null,
     subtitle: {
       status: status.status,
@@ -76,10 +88,15 @@ function episodeView(source) {
       updatedAt: meta.updatedAt || null,
       hasRawOriginal: existsSize(path.join(subtitlesDir, "original-raw.vtt")) > 0,
       hasOriginal: existsSize(path.join(subtitlesDir, "original.vtt")) > 0,
-      hasFinal: existsSize(path.join(subtitlesDir, "pt-BR.vtt")) > 0,
+      hasFinal: status.status === "ready",
+      metrics: { stagesMs: meta.stageDurationsMs || {}, translation: meta.translationDetails?.metrics ? {
+        calls: meta.translationDetails.metrics.episodeCalls ?? meta.translationDetails.metrics.calls,
+        elapsedMs: meta.translationDetails.metrics.elapsedMs, promptTokens: meta.translationDetails.metrics.promptTokens,
+        outputTokens: meta.translationDetails.metrics.outputTokens,
+      } : null },
       outputs: {
-        vtt: existsSize(path.join(subtitlesDir, "pt-BR.vtt")) > 0,
-        srt: existsSize(path.join(subtitlesDir, "pt-BR.srt")) > 0,
+        vtt: status.status === "ready",
+        srt: Boolean(status.srtPath),
         embedded: playbackStorageBytes(source.sourceId) > 0,
       },
     },

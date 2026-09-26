@@ -39,3 +39,4 @@ jobs:
         with:
           python-version: "3.11"
       - run: python -m compileall -q intelligence
+      - run: python -m unittest discover -s intelligence -p "test_*.py"

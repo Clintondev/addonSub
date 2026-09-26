@@ -32,7 +32,11 @@ async function transcribeSource(sourceUrl, outputDir, sourceId, prompt = "", opt
     sourceAudioLanguage: options.language || data.language || "und",
     sourceAudioReason: options.reason || "automatic-transcription-audio",
     sourceAudioConfidence: options.confidence || "unknown",
-    translationRoute: "direct-original-audio-transcription",
+    translationRoute: options.reason === "original-audio-unavailable" || !options.language ? "direct-selected-audio-transcription" : "direct-original-audio-transcription",
+    transcriptionQuality: data.quality && typeof data.quality === "object" ? data.quality : null,
+    transcriptionRecoveryReason: data.recoveryReason || null,
+    repairedTranscriptionSegments: Number(data.repairedSegments || 0),
+    speechIntervals: Array.isArray(data.speechIntervals) ? data.speechIntervals : null,
   };
 }
 

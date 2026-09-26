@@ -29,8 +29,9 @@ async function enqueueSubtitleJob(payload, priority = 5) {
   const existing = await queue.getJob(payload.sourceId);
   if (existing) {
     const state = await existing.getState();
+    if (state !== "active" && state !== "completed") await existing.updateData({ ...existing.data, ...payload });
     if (state === "failed") {
-      await existing.retry();
+      await existing.retry("failed", { resetAttemptsMade: true, resetAttemptsStarted: true });
       return existing;
     }
     if (state !== "completed") {

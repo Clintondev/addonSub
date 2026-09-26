@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { mapTargetLocale } = require("../src/services/translate");
-const { analyzeCueIntegrity, assertCueIntegrity, assertSubtitleCompleteness, localizeBrazilianPortuguese, mergeShortCues, finalizeCues, displayChunks, normalizeDialogueMarkers, preserveDialogueLayout, removeEmptyCues } = require("../src/services/subtitleQuality");
+const { analyzeCueIntegrity, analyzeReferenceCoverage, assertCueIntegrity, assertSubtitleCompleteness, localizeBrazilianPortuguese, mergeShortCues, finalizeCues, displayChunks, normalizeDialogueMarkers, preserveDialogueLayout, removeEmptyCues, removeTransientOcrNoise, suspiciousTranscriptionRepetitions, suspiciousTranscriptionArtifacts } = require("../src/services/subtitleQuality");
 
 test("maps Brazilian Portuguese to LibreTranslate API code", () => {
   assert.equal(mapTargetLocale("pt-BR"), "pt-BR");
@@ -28,6 +28,25 @@ test("merges excessively short adjacent transcription cues", () => {
   assert.equal(merged.length, 2);
   assert.equal(merged[0].text, "You know. The answer.");
   assert.match(merged[0].time, /00:00:01\.800/);
+});
+
+test("flags a long repeated transcription phrase without treating short dialogue as hallucination", () => {
+  const phrase = "ご視聴ありがとうございました。";
+  const cues = Array.from({ length: 5 }, (_, index) => ({
+    time: `00:${String(index * 2).padStart(2, "0")}:00.000 --> 00:${String(index * 2).padStart(2, "0")}:02.000`,
+    text: index % 2 ? phrase.slice(0, -1) : phrase,
+  }));
+  assert.deepEqual(suspiciousTranscriptionRepetitions(cues).map((item) => item.count), [5]);
+  assert.deepEqual(suspiciousTranscriptionRepetitions(cues.map((cue) => ({ ...cue, text: "Sim!" }))), []);
+});
+
+test("flags transcribed media metadata without rejecting ordinary numbered dialogue", () => {
+  const cues = [
+    { text: "85.mkv. Torrenti1080p" },
+    { text: "1080p" },
+    { text: "Estamos no episódio 85." },
+  ];
+  assert.deepEqual(suspiciousTranscriptionArtifacts(cues), cues.slice(0, 2));
 });
 
 test("wraps and extends readable cues without overlapping the next cue", () => {
@@ -133,10 +152,51 @@ test("rejects a one-line subtitle for a full episode", () => {
   assert.throws(() => assertSubtitleCompleteness(cues, 1467), /incompleta: 1 falas/);
 });
 
+test("rejects a transcription that silently loses dialogue in the middle of an episode", () => {
+  const cues = [
+    { time: "00:03:10.000 --> 00:03:12.000", text: "Antes." },
+    { time: "00:04:30.000 --> 00:04:32.000", text: "Depois." },
+    ...Array.from({ length: 100 }, (_, index) => ({
+      time: `00:${String(5 + Math.floor(index / 10)).padStart(2, "0")}:${String(index % 10).padStart(2, "0")}.000 --> 00:${String(5 + Math.floor(index / 10)).padStart(2, "0")}:${String(index % 10 + 1).padStart(2, "0")}.000`,
+      text: `Fala ${index}.`,
+    })),
+    { time: "00:21:00.000 --> 00:21:02.000", text: "Final." },
+  ];
+  assert.throws(() => assertSubtitleCompleteness(cues, 1467, {
+    minimumCuesPerMinute: 4,
+    maxInteriorGapSeconds: 45,
+    ignoreEndingSeconds: 1000,
+    speechIntervals: [{ start: 193, end: 269 }],
+  }), /perdeu fala detectada de 76\.0s/);
+});
+
 test("removes OCR frames that contain no readable text", () => {
   const cues = [
     { time: "00:00:01.000 --> 00:00:02.000", text: "  " },
     { time: "00:00:03.000 --> 00:00:04.000", text: "Dialogue" },
   ];
   assert.deepEqual(removeEmptyCues(cues).map((cue) => cue.text), ["Dialogue"]);
+});
+
+test("removes only transient one-character OCR noise", () => {
+  const cues = [
+    { time: "00:00:01.000 --> 00:00:01.125", text: '"H"' },
+    { time: "00:00:02.000 --> 00:00:04.000", text: "I" },
+    { time: "00:00:05.000 --> 00:00:05.100", text: "OK" },
+  ];
+  assert.deepEqual(removeTransientOcrNoise(cues).map((cue) => cue.text), ["I", "OK"]);
+});
+
+test("audits audio transcription coverage from subtitle packet timing without using its text", () => {
+  const cues = [
+    { time: "00:00:09.000 --> 00:00:12.000", text: "Primeira fala." },
+    { time: "00:00:29.000 --> 00:00:32.000", text: "Terceira fala." },
+  ];
+  const audit = analyzeReferenceCoverage(cues, [
+    { start: 10, end: 11 }, { start: 20, end: 21 }, { start: 30, end: 31 },
+  ], { toleranceSeconds: 1, minimumReferenceCues: 1 });
+  assert.equal(audit.referenceCues, 3);
+  assert.equal(audit.matchedCues, 2);
+  assert.equal(audit.coverageRatio, 2 / 3);
+  assert.equal(audit.longestUncoveredRunSeconds, 1);
 });

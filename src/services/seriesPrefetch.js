@@ -2,6 +2,7 @@ const fs = require("fs");
 const path = require("path");
 const fetch = require("node-fetch");
 const config = require("../config");
+const { queueWebPreparation } = require("./webPreparation");
 const logger = require("../logger");
 const sourceStore = require("./sourceStore");
 const watchStore = require("./watchStore");
@@ -159,6 +160,7 @@ async function discoverPrefetchSource(selected, videoId, torrentFiles) {
 
 async function runPrefetch(selected, aheadOverride) {
   const current = parseVideoId("series", selected.videoId);
+  const playbackProfile = selected.playbackProfile || watchStore.get(current.imdbId)?.playbackProfile || "local";
   const configured = watchStore.get(current.imdbId)?.prefetchAhead;
   const ahead = Number.isInteger(aheadOverride) ? aheadOverride : Number.isInteger(configured) ? configured : config.prefetch.ahead;
   if (ahead <= 0) return [];
@@ -185,10 +187,11 @@ async function runPrefetch(selected, aheadOverride) {
       });
       if (translationStatus(record.sourceId).status !== "ready") {
         await savePendingSubtitle(record.sourceId);
-        await queueTranslationJob(record.sourceId, config.prefetch.priority);
+        await queueTranslationJob(record.sourceId, config.prefetch.priority, { playbackProfile });
         const processingStages = new Set(["acquiring", "recovering", "probing", "transcribing", "synchronizing", "contextualizing", "aligning", "translating", "validating", "packaging"]);
         transitionIf(record.sourceId, "prefetch-queued", { parentSourceId: selected.sourceId, position: index + 1, videoId }, (currentMeta) => !processingStages.has(currentMeta.stage));
       }
+      else if (playbackProfile === "web") await queueWebPreparation(record.sourceId, { priority: config.prefetch.priority });
       queued.push({ sourceId: record.sourceId, videoId, sameTorrent: record.infoHash === selected.infoHash });
     } catch (error) {
       logger.warn("Episode prefetch discovery failed", { videoId, selectedSourceId: selected.sourceId, error: error.message });
@@ -202,7 +205,7 @@ function scheduleSeriesPrefetch(sourceId, { force = false, ahead } = {}) {
   if (!config.prefetch.enabled) return Promise.resolve([]);
   const selected = sourceStore.get(sourceId);
   if (!selected || selected.type !== "series") return Promise.resolve([]);
-  const key = `${selected.videoId}|${selected.affinitySourceId || selected.sourceId}`;
+  const key = `${selected.videoId}|${selected.affinitySourceId || selected.sourceId}|${selected.playbackProfile || watchStore.get(watchStore.keyFor(selected))?.playbackProfile || "local"}`;
   if (running.has(key)) return running.get(key);
   if (!force && Date.now() - (lastScheduled.get(key) || 0) < config.prefetch.cooldownMs) return Promise.resolve([]);
   lastScheduled.set(key, Date.now());

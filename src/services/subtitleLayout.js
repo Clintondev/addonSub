@@ -5,18 +5,10 @@ const { parseVtt, serializeVtt } = require("./vtt");
 const { applyPgsPositions, parsePgsPositions, withPositionSettings } = require("./pgs");
 const { finalizeCues, normalizeDialogueMarkers, parseTimestamp, preserveDialogueLayout } = require("./subtitleQuality");
 const { safeChildPath } = require("../utils/security");
-const { vttCuesToAss } = require("./ass");
 const { inferProtectedTerms } = require("./translate");
+const { publishSubtitle, readPublication } = require("./subtitlePublication");
 
 const LAYOUT_VERSION = 4;
-
-function writeAss(dir, cues) {
-  const assPath = path.join(dir, "pt-BR.ass");
-  const temporary = `${assPath}.layout.tmp`;
-  fs.writeFileSync(temporary, vttCuesToAss(cues), "utf8");
-  fs.renameSync(temporary, assPath);
-  return assPath;
-}
 
 function timing(cue) {
   const match = String(cue.time || "").match(/^(\d+:\d{2}:\d{2}\.\d{3})\s+-->\s+(\d+:\d{2}:\d{2}\.\d{3})(.*)$/);
@@ -39,17 +31,14 @@ function repairSubtitleLayout(sourceId, { backup = false, force = false } = {}) 
     } catch (_) {}
   }
   const meta = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const publication = readPublication(sourceId);
+  const publish = (cues) => publishSubtitle(sourceId, cues, { fingerprint: publication?.fingerprint || meta.extractionFingerprint,
+    profile: publication?.profile, provenance: publication?.provenance, maxCueSeconds: meta.origin === "faster-whisper" ? 20 : 60 });
   const track = /ocr-pgs-track-(\d+)/.exec(String(meta.origin || ""));
   if (!track) {
     const current = fs.readFileSync(finalPath, "utf8");
     const finalCues = finalizeCues(parseVtt(current).map((cue) => ({ ...cue, text: normalizeDialogueMarkers(cue.text) })));
-    const serialized = serializeVtt(finalCues);
-    if (serialized !== current) {
-      const temporary = `${finalPath}.layout.tmp`;
-      fs.writeFileSync(temporary, serialized, "utf8");
-      fs.renameSync(temporary, finalPath);
-    }
-    writeAss(dir, finalCues);
+    publish(finalCues);
     const result = { version: LAYOUT_VERSION, sourceId, cues: finalCues.length, positioned: 0, dialogues: 0, finalMtimeMs: fs.statSync(finalPath).mtimeMs, completedAt: new Date().toISOString() };
     fs.writeFileSync(markerPath, JSON.stringify(result, null, 2), "utf8");
     return result;
@@ -84,12 +73,9 @@ function repairSubtitleLayout(sourceId, { backup = false, force = false } = {}) 
     fs.copyFileSync(finalPath, path.join(dir, `pt-BR-before-layout-${stamp}.vtt`));
   }
   const originalTemporary = `${originalPath}.layout.tmp`;
-  const finalTemporary = `${finalPath}.layout.tmp`;
   fs.writeFileSync(originalTemporary, serializeVtt(sourceCues), "utf8");
-  fs.writeFileSync(finalTemporary, serializeVtt(formatted), "utf8");
   fs.renameSync(originalTemporary, originalPath);
-  fs.renameSync(finalTemporary, finalPath);
-  writeAss(dir, formatted);
+  publish(formatted);
   const result = { version: LAYOUT_VERSION, sourceId, cues: formatted.length, positioned, dialogues, finalMtimeMs: fs.statSync(finalPath).mtimeMs, completedAt: new Date().toISOString() };
   fs.writeFileSync(markerPath, JSON.stringify(result, null, 2), "utf8");
   return result;

@@ -39,9 +39,9 @@ http://localhost:7000/manifest.json
 3. Esse primeiro clique inicia o download local. O Stremio pode mostrar uma falha temporária porque o arquivo ainda não está pronto.
 4. Aguarde o download terminar e abra novamente a lista de streams.
 5. No aplicativo para PC ou em aparelhos compatíveis, selecione `LOCAL`. Quando a legenda está pronta, o gateway cria sem recodificação um MKV de reprodução que preserva o vídeo e todas as faixas de áudio, incorpora uma única legenda SRT chamada `Português (Brasil)` e a marca como padrão. O índice de navegação fica no início do arquivo e a mídia usa blocos curtos, próprios para leitura remota por intervalos, evitando buscas até o final do MKV durante a troca das falas. A versão SRT externa continua disponível como alternativa.
-6. No Stremio Web, iPhone ou aparelho que rejeite MKV/x265, selecione `WEB HLS`. O primeiro segmento é preparado pela GPU e a reprodução começa enquanto o restante é convertido. O áudio padrão permanece dentro do vídeo em AAC, evitando silêncio em navegadores que não carregam uma playlist de áudio separada; os outros idiomas aparecem como alternativas no seletor. Para não depender do suporte inconsistente dos players web a WebVTT HLS, o PT-BR é aplicado à imagem durante a conversão H.264. O SRT externo continua disponível, e o modo `LOCAL` mantém a legenda selecionável.
+6. No Stremio Web, iPhone ou aparelho que rejeite MKV/x265, selecione `WEB PREPARAR` para iniciar a conversão HLS. Esse primeiro clique pode mostrar uma falha temporária. Quando a lista passar a mostrar `WEB VOD`, selecione o episódio novamente: a playlist completa informa a duração total e permite avançar ou voltar para qualquer minuto. O áudio padrão permanece dentro do vídeo em AAC, evitando silêncio em navegadores que não carregam uma playlist de áudio separada; os outros idiomas aparecem como alternativas no seletor. Para não depender do suporte inconsistente dos players web a WebVTT HLS, o PT-BR é aplicado à imagem durante a conversão H.264. O SRT externo continua disponível, e o modo `LOCAL` mantém a legenda selecionável.
 7. Durante a preparação, o gateway prioriza legendas dentro do próprio arquivo: texto PT-BR, texto em outro idioma e PGS por OCR. Somente quando nenhuma delas existe ele transcreve o áudio com Whisper `large-v3`.
-8. Ao escolher um episódio de série, o gateway prepara em segundo plano a quantidade de episódios seguintes configurada no gerenciador (de 0 a 12; o padrão é 0). Pacotes de temporada reutilizam exatamente o mesmo torrent; para torrents individuais, a busca mantém o mesmo add-on, grupo, resolução, codec e tipo de release sempre que possível.
+8. Ao escolher um episódio de série, o gateway prepara em segundo plano a quantidade de episódios seguintes configurada no gerenciador (de 0 a 12; o padrão é 0). Pacotes de temporada reutilizam exatamente o mesmo torrent; para torrents individuais, a busca mantém o mesmo add-on, grupo, resolução, codec e tipo de release sempre que possível. O Stremio pode selecionar automaticamente o próximo stream WEB do mesmo tipo, mas ele só começa a tocar quando a conversão VOD desse episódio também estiver completa.
 
 O episódio escolhido usa prioridade alta. Os episódios antecipados usam prioridade baixa e não são enfileirados novamente quando vídeo e legenda já estão prontos. Quando você abre o episódio seguinte, a janela avança e novos episódios são acrescentados até manter a quantidade configurada. Com o valor 0, nenhum download antecipado é feito.
 
@@ -87,8 +87,8 @@ ALLOWED_CLIENT_IPS=203.0.113.25,2001:db8:1234::/64
 ```
 
 Se o provedor alterar seu IP público, atualize o `.env` e execute
-`docker compose up -d` novamente. A porta 7000 fica vinculada somente a
-`127.0.0.1`; acessos remotos chegam pelo Cloudflare Tunnel e são validados por
+`docker compose up -d` novamente. A porta 7000 fica vinculada a
+`127.0.0.1` e ao IP configurado em `LAN_BIND_IP`; ajuste esse valor para o endereço do servidor na sua rede. Acessos remotos chegam pelo Cloudflare Tunnel e são validados por
 `CF-Connecting-IP`. O Stremio no computador do servidor continua autorizado.
 
 No painel é possível:
@@ -131,10 +131,15 @@ As principais opções estão em `.env.example`:
 - `SUBTITLE_TOKEN_SECRET` e `ADMIN_TOKEN`: segredos locais; gere valores diferentes e não os publique.
 - `ALLOWED_CLIENT_IPS`: IPs públicos ou redes CIDR autorizados; vazio desativa a restrição.
 - `BASE_URL`: use `http://localhost:7000` quando o Stremio estiver no mesmo computador.
+- `LAN_BIND_IP`, `LAN_BASE_URL` e `LAN_CLIENT_IPS`: configuram o vínculo da porta e o endereço LAN entregue aos clientes da rede da casa. Atualize o `.env` se o roteador ou o PC mudar de endereço.
 - `HLS_VIDEO_BITRATE_KBPS` e `HLS_MAX_HEIGHT`: qualidade máxima da opção compatível com navegador.
 - `HLS_CACHE_MAX_AGE_HOURS`: tempo de retenção dos segmentos HLS gerados.
 - `REMOTE_FETCH_TIMEOUT_SECONDS` e `REMOTE_FETCH_MAX_MB`: limites para recursos e redirecionamentos remotos.
 - `GPU_LOCK_WAIT_SECONDS` e `GPU_LOCK_LEASE_SECONDS`: coordenam Whisper, tradução e NVENC.
+- `TRANSLATION_BLOCK_MAX_CALLS`, `TRANSLATION_BLOCK_TIMEOUT_SECONDS`, `TRANSLATION_EPISODE_MAX_CALLS` e `TRANSLATION_EPISODE_TIMEOUT_MINUTES`: limitam chamadas e tempo total, incluindo reparos e divisão de blocos. O contexto completo respeita `CONTEXTUAL_TRANSLATOR_CONTEXT_TOKENS`.
+- `TRANSLATION_GPU_BATCH_BLOCKS`: quantidade de cenas por reserva antes de ceder os recursos. O 4B com zero camadas na GPU usa CPU; a reserva do servidor de modelos impede trocas concorrentes de modelo.
+- `SUBTITLE_MAX_CPS` e `SUBTITLE_MIN_CUE_SECONDS`: limites de velocidade de leitura e duração mínima. Falas rápidas recebem reparo pontual; o job falha se o resultado continuar ilegível.
+- `WHISPER_REJECT_MIN_CONFIDENCE` e `WHISPER_REJECT_MAX_LOW_CONFIDENCE_RATIO`: rejeição explícita quando a recuperação continua com confiança insuficiente. Silêncio e repetição isolados são avisos; lacunas de transcrição são confrontadas com fala detectada por VAD.
 - `SERIES_PREFETCH_ENABLED`: permite a preparação antecipada configurada pelo gerenciador e atualizada a cada reprodução.
 - `SERIES_PREFETCH_AHEAD`: quantidade escolhida no gerenciador; o padrão `0` não baixa episódios automaticamente.
 - `SERIES_PREFETCH_PRIORITY`: prioridade inferior usada pelos trabalhos antecipados.
@@ -154,11 +159,19 @@ O qBittorrent WebUI não é publicado para o Windows: ele fica acessível apenas
 - faster-whisper `large-v3` na GPU para transcrição de último recurso.
 - FFmpeg com NVENC para HLS H.264/AAC compatível com navegadores, com fallback para CPU.
 
-O worker só publica uma legenda depois de validar quantidade de falas, IDs, marcações de tempo, sobreposições, durações anormais e fidelidade objetiva. Ele forma um par entre áudio original e legenda do mesmo idioma para arquivos locais, HLS e DASH. A prioridade é: legenda completa em PT-BR, legenda completa no idioma original, transcrição direta do áudio original e, somente quando isso não é possível, idioma intermediário. A rota, o idioma do áudio e o grau de confiança da identificação ficam registrados no gerenciador.
+O worker só publica uma legenda depois de validar quantidade de falas, IDs, marcações de tempo, sobreposições, durações anormais e fidelidade objetiva. Ele forma um par entre áudio original e legenda do mesmo idioma para arquivos locais, HLS e DASH. A prioridade é: legenda completa em PT-BR, legenda completa no idioma original, legenda completa em outro idioma e, quando não há uma faixa completa utilizável, transcrição do áudio original. A cobertura da transcrição e do OCR é comparada aos tempos da faixa embutida quando disponível. A rota, o idioma do áudio e o grau de confiança da identificação ficam registrados no gerenciador.
 
 Fontes PGS preservam `original-raw.vtt` para auditoria e usam um `original.vtt` saneado para tradução. Como o OCR PGS atual reconhece inglês com segurança, uma PGS em outro idioma não é enviada ao OCR inglês: o sistema prefere transcrever o áudio original. Trechos de música em japonês romanizado são separados do diálogo principal e recebem instrução de idioma própria. Resultados parciais de OCR possuem marcador atômico de conclusão e nunca são reutilizados como se estivessem completos.
 
 Depois da tradução e do alinhamento, o texto é remontado por fala e comparado integralmente com a saída do tradutor. Qualquer palavra perdida, repetida ou movida entre falas impede a publicação. A saída final também é limitada a duas linhas visuais de até 42 caracteres, mantendo a ordem e as janelas temporais da fonte.
+
+## Publicação e preparação
+
+O resultado validado é publicado em uma geração com VTT, SRT e ASS e um manifesto de hashes. Consultas de status e downloads não alteram o layout. O cache considera mídia, versão do fluxo, prompt, modelo, regras de nomes/terminologia e limites de leitura; arquivos antigos prontos continuam disponíveis até nova preparação.
+
+A preparação WEB tem fila própria e começa após a publicação da legenda. Conversões usam um diretório temporário e publicam playlists/segmentos de uma geração completa, com URLs versionadas. A antecipação acompanha o último perfil LOCAL ou WEB reproduzido e respeita a janela configurada da série.
+
+O endpoint `POST /api/sources/:sourceId/reprocess` aceita `mode`: `resume` retoma checkpoints, `retranslate` gera traduções novas reutilizando a extração e `reextract` refaz também a extração/OCR. O padrão é `retranslate`. As versões anteriores permanecem disponíveis durante a preparação.
 
 ## Qualidade e verificação
 
@@ -167,6 +180,6 @@ npm run check
 npm run test:coverage
 ```
 
-O primeiro comando executa análise estática, testes e auditoria das dependências de produção. O segundo exige no mínimo 60% de linhas, 70% de desvios e 65% de funções cobertas. A automação do repositório repete essas verificações em Node.js 20 e 22, valida a configuração Docker Compose e verifica a sintaxe dos serviços Python.
+O primeiro comando executa análise estática, testes e auditoria das dependências de produção. O segundo exige no mínimo 60% de linhas, 70% de desvios e 65% de funções cobertas. A automação do repositório repete essas verificações em Node.js 20 e 22, valida a configuração Docker Compose e executa os testes Python de recuperação com dados simulados. Esses testes não carregam modelos nem processam episódios.
 
 Consulte [PROJECT_DOCUMENTATION.md](./PROJECT_DOCUMENTATION.md) para o histórico e os requisitos conceituais. Quando houver divergência, este README e o código atual são as fontes operacionais.

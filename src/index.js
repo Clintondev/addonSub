@@ -6,21 +6,22 @@ const logger = require("./logger");
 const { getMetricsText } = require("./metrics");
 const { aggregateStreams } = require("./services/upstreams");
 const sourceStore = require("./services/sourceStore");
-const { ensureSrtSubtitle, queueTranslationJob, savePendingSubtitle, subtitlePath } = require("./services/subtitleService");
+const { queueTranslationJob, savePendingSubtitle, subtitlePath } = require("./services/subtitleService");
+const { publishedFile } = require("./services/subtitlePublication");
+const { queueWebPreparation } = require("./services/webPreparation");
 const { readMeta, transition, transitionIf } = require("./services/metadata");
-const { verifyPath } = require("./utils/security");
+const { verifyPath, stableHash } = require("./utils/security");
 const { getQueue } = require("./jobs/queue");
-const { ensureHls, outputPath: hlsOutputPath, pruneHlsCache, scheduleHlsCachePruning } = require("./services/hlsPlayback");
+const { cacheComplete: hlsCacheComplete, readMetadata: hlsMetadata, inputFingerprint: hlsInputFingerprint, outputPath: hlsOutputPath, pruneHlsCache, scheduleHlsCachePruning } = require("./services/hlsPlayback");
 const { scheduleSeriesPrefetch, fetchSeriesMetadata, readSeriesMetadataCache, selectAffinityItem } = require("./services/seriesPrefetch");
 const watchStore = require("./services/watchStore");
 const manager = require("./services/manager");
 const { parseVideoId } = require("./services/videoId");
-const { repairSubtitleLayout } = require("./services/subtitleLayout");
 const { markCancelled } = require("./services/cancellationStore");
 const { createClientAccessMiddleware } = require("./utils/clientAccess");
 const { healthReport } = require("./services/health");
 const { parseVtt, serializeVtt } = require("./services/vtt");
-const { associatedTranslationStatus, subtitleOwner } = require("./services/subtitleAssociation");
+const { associatedTranslationStatus } = require("./services/subtitleAssociation");
 const { ensureEmbeddedPlayback } = require("./services/embeddedPlayback");
 const { getStorageUsage } = require("./services/storageUsage");
 
@@ -38,7 +39,19 @@ function buildManifest() {
   };
 }
 
-function externalSubtitleView(record, status, { includeAddon = false } = {}) {
+function playbackBaseUrl(req) {
+  const host = String(req.headers.host || "").toLowerCase();
+  if (/^(?:localhost|127\.0\.0\.1)(?::\d+)?$/.test(host)) return `http://${host}`;
+  const clientIp = String(req.headers["cf-connecting-ip"] || "").trim();
+  return config.lanBaseUrl && config.lanClientIps.includes(clientIp) ? config.lanBaseUrl : config.baseUrl;
+}
+
+function playbackUrl(url, baseUrl) {
+  return typeof url === "string" && url.startsWith(`${config.baseUrl}/`)
+    ? `${baseUrl}${url.slice(config.baseUrl.length)}` : url;
+}
+
+function externalSubtitleView(record, status, { includeAddon = false, baseUrl = config.baseUrl } = {}) {
   const ready = status.status === "ready";
   return {
     // Bump the id when changing the advertised format so Stremio does not
@@ -48,27 +61,42 @@ function externalSubtitleView(record, status, { includeAddon = false } = {}) {
     name: ready
       ? `PT-AUTO · Português (Brasil)${includeAddon ? ` · ${record.addonName}` : ""}`
       : "PT-AUTO (preparando)",
-    url: status.srtUrl || status.url,
+    url: playbackUrl(status.srtUrl || status.url, baseUrl),
   };
 }
 
 function streamView(item, mode = "direct", options = {}) {
   const { stream, record } = item;
+  const baseUrl = options.baseUrl || config.baseUrl;
   const status = options.status || associatedTranslationStatus(record);
   const subtitleReady = status.status === "ready";
   const playbackSourceId = mode === "hls" && status.associated ? status.subtitleSourceId : record.sourceId;
   const localReady = Boolean(record.localPath && fs.existsSync(record.localPath));
-  const behaviorHints = { ...(stream.behaviorHints || {}), bingeGroup: stream.behaviorHints?.bingeGroup || `pt-auto-${record.sourceId}` };
-  if (mode === "hls") behaviorHints.filename = `pt-auto-${playbackSourceId}.m3u8`;
+  const groupIdentity = `${record.addonId || record.addonName || "gateway"}|${stream.name || record.name || "stream"}`;
+  const audioIndex = Number.isInteger(options.audioIndex) ? options.audioIndex : null;
+  const behaviorHints = { ...(stream.behaviorHints || {}), bingeGroup: `pt-auto-${mode}${audioIndex === null ? "" : `-audio-${audioIndex}`}-${stableHash(groupIdentity, 16)}` };
+  let hlsReady = false;
+  let hlsPlan = null;
+  if (mode === "hls" && localReady) {
+    try {
+      const subtitleFile = status.assPath || status.srtPath || null;
+      const completed = hlsCacheComplete(playbackSourceId, hlsInputFingerprint(record.localPath, subtitleFile));
+      hlsReady = Boolean(completed);
+      hlsPlan = completed?.plan || null;
+    } catch (_) { /* A stale or incomplete cache is shown as preparing. */ }
+  }
+  const audioTrack = audioIndex === null ? null : hlsPlan?.audioTracks?.find((track) => track.outputIndex === audioIndex);
+  const audioLabel = audioTrack ? audioTrack.language === "jpn" ? "Japonês" : audioTrack.language === "eng" ? "Inglês" : audioTrack.title || `Áudio ${audioIndex + 1}` : null;
+  if (mode === "hls") behaviorHints.filename = `pt-auto-${playbackSourceId}${audioTrack ? `-audio-${audioIndex}` : ""}.m3u8`;
   const result = {
     ...stream,
     name: mode === "hls"
-      ? `${localReady ? "WEB HLS" : "WEB PREPARAR"} · ${stream.name || "Stream"}`
+      ? `${hlsReady ? "WEB VOD" : "WEB PREPARAR"}${audioLabel ? ` · ${audioLabel}` : ""} · ${stream.name || "Stream"}`
       : `${localReady ? "LOCAL" : record.infoHash ? "PREPARAR" : record.addonName} · ${stream.name || "Stream"}`,
     title: mode === "hls"
-      ? localReady
+      ? hlsReady
         ? `${subtitleReady ? "PT-BR pronta" : "Vídeo pronto · PT-BR em preparação"} · ${stream.title || stream.name || record.filename || "Stream"}`
-        : `Primeiro acesso prepara; tente novamente depois · ${stream.title || stream.name || record.filename || "Stream"}`
+        : `${localReady ? "Primeiro acesso converte o episódio; tente novamente depois" : "Primeiro acesso prepara; tente novamente depois"} · ${stream.title || stream.name || record.filename || "Stream"}`
       : localReady
         ? `${subtitleReady ? "Pronto com PT-BR interna" : "Vídeo pronto · PT-BR em preparação"} · ${stream.title || stream.name || record.filename || "Stream"}`
         : record.infoHash
@@ -79,29 +107,35 @@ function streamView(item, mode = "direct", options = {}) {
   if (mode === "hls") {
     delete result.infoHash;
     delete result.fileIdx;
-    result.url = `${config.baseUrl}/hls/${playbackSourceId}/master.m3u8?profile=web-av-subs-v2`;
+    result.url = `${baseUrl}/hls/${playbackSourceId}/master.m3u8?profile=web-vod-v5${audioTrack ? `&audio=${audioIndex}` : ""}`;
   } else if (record.url || record.infoHash) {
     delete result.infoHash;
     delete result.fileIdx;
-    result.url = `${config.baseUrl}/play/${record.sourceId}?profile=ptbr-stream-v2`;
+    result.url = `${baseUrl}/play/${record.sourceId}?profile=ptbr-stream-v2`;
   }
   // Advertise the exact source subtitle in both modes. HLS also carries a
   // native WebVTT rendition, while SRT remains a broad player fallback.
-  if (subtitleReady) result.subtitles = [externalSubtitleView(record, status)];
+  if (subtitleReady) result.subtitles = [externalSubtitleView(record, status, { baseUrl })];
   return result;
 }
 
 function streamViews(item, options = {}) {
   const status = associatedTranslationStatus(item.record);
-  if (item.record.localPath && status.status === "ready" && status.srtPath) {
-    ensureEmbeddedPlayback(status.subtitleSourceId, item.record.localPath, status.srtPath)
-      .catch((error) => logger.warn("Falha ao antecipar MKV local com PT-BR", { sourceId: item.record.sourceId, subtitleSourceId: status.subtitleSourceId, error: error.message }));
-  }
   const viewOptions = { ...options, status };
   const direct = streamView(item, "direct", viewOptions);
   const { record } = item;
   if (!record.infoHash && !record.localPath) return [direct];
-  return [direct, streamView(item, "hls", viewOptions)];
+  const hls = streamView(item, "hls", viewOptions);
+  if (!hls.name.startsWith("WEB VOD")) return [direct, hls];
+  const playbackSourceId = status.associated ? status.subtitleSourceId : record.sourceId;
+  let tracks = [];
+  try {
+    const subtitleFile = status.assPath || status.srtPath || null;
+    tracks = hlsCacheComplete(playbackSourceId, hlsInputFingerprint(record.localPath, subtitleFile))?.plan?.audioTracks || [];
+  } catch (_) { /* Cache can disappear between listing and playback. */ }
+  return tracks.length > 1
+    ? [direct, ...tracks.map((track) => streamView(item, "hls", { ...viewOptions, audioIndex: track.outputIndex }))]
+    : [direct, hls];
 }
 
 function normalizedFilename(value) {
@@ -110,7 +144,7 @@ function normalizedFilename(value) {
 
 function subtitleRequestSelector(extra = "") {
   const requested = new URLSearchParams(String(extra)).get("filename") || "";
-  const hlsSource = /^pt-auto-(src_[a-f0-9]+)\.m3u8$/i.exec(requested);
+  const hlsSource = /^pt-auto-(src_[a-f0-9]+)(?:-audio-\d+)?\.m3u8$/i.exec(requested);
   return { filename: normalizedFilename(requested), sourceId: hlsSource?.[1] || null };
 }
 
@@ -128,28 +162,19 @@ function hlsAttribute(value) {
   return String(value || "").replace(/["\r\n]/g, " ").trim();
 }
 
-function buildHlsMasterPlaylist(hasPtBrSubtitle, audioTracks = []) {
+function buildHlsMasterPlaylist(plan = {}) {
   const lines = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-INDEPENDENT-SEGMENTS"];
-  const declaredDefault = audioTracks.findIndex((track) => track.isDefault);
-  const defaultAudioIndex = declaredDefault >= 0 ? declaredDefault : 0;
+  const audioTracks = plan.audioTracks || [];
   audioTracks.forEach((track, index) => {
     const title = hlsAttribute(track.title || (track.language === "jpn" ? "Japonês" : track.language === "eng" ? "Inglês" : `Áudio ${index + 1}`));
     const language = hlsAttribute(track.language || "und");
     const channels = track.channels ? `,CHANNELS="${Number(track.channels)}"` : "";
-    // The default rendition is already muxed into video.m3u8. Advertising a
-    // second URI for it makes some web players discard both audio sources.
-    // HLS represents an in-band rendition by omitting URI.
-    const uri = index !== defaultAudioIndex && track.playlist ? `,URI="${hlsAttribute(track.playlist)}"` : "";
-    lines.push(`#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="${title}",DEFAULT=${index === defaultAudioIndex ? "YES" : "NO"},AUTOSELECT=YES,LANGUAGE="${language}"${uri}${channels}`);
+    lines.push(`#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="${title}",DEFAULT=${track.isDefault ? "YES" : "NO"},AUTOSELECT=YES,LANGUAGE="${language}",URI="${hlsAttribute(track.playlist)}"${channels}`);
   });
-  if (hasPtBrSubtitle) {
-    lines.push('#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="Português (Brasil)",DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,LANGUAGE="pt-BR",URI="subtitles.m3u8"');
-  }
-  const attributes = [`BANDWIDTH=${(config.hls.videoBitrateKbps + (audioTracks.length ? config.hls.audioBitrateKbps : 0)) * 1000}`];
-  if (audioTracks.length) attributes.push('AUDIO="audio"');
-  if (hasPtBrSubtitle) attributes.push('SUBTITLES="subs"');
-  lines.push(`#EXT-X-STREAM-INF:${attributes.join(",")}`);
-  lines.push("video.m3u8", "");
+  const bandwidth = (config.hls.videoBitrateKbps + (audioTracks.length ? config.hls.audioBitrateKbps : 0)) * 1000;
+  const codecs = hlsAttribute(plan.codecs || `avc1.640028${audioTracks.length ? ",mp4a.40.2" : ""}`);
+  lines.push(`#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},CODECS="${codecs}"${audioTracks.length ? ',AUDIO="audio"' : ""}`);
+  lines.push("video-only.m3u8", "");
   return lines.join("\n");
 }
 
@@ -205,15 +230,19 @@ function createAddonRouter() {
   router.get("/stream/:type/:id.json", async (req, res) => {
     const { type, id } = req.params;
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-    try { res.json({ streams: (await aggregateStreams(type, id)).flatMap(streamViews) }); }
+    try {
+      const baseUrl = playbackBaseUrl(req);
+      res.json({ streams: (await aggregateStreams(type, id)).flatMap((item) => streamViews(item, { baseUrl })) });
+    }
     catch (error) { logger.warn("Stream aggregation rejected", { type, id, error: error.message }); res.json({ streams: [] }); }
   });
-  const subtitlesHandler = ({ params }, res) => {
+  const subtitlesHandler = (req, res) => {
+    const { params } = req;
     const { id } = params;
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
     const subtitles = selectSubtitleSources(id, params.extra).map((source) => ({ source, status: associatedTranslationStatus(source) }))
       .filter(({ status }) => status.status === "ready")
-      .map(({ source, status }) => externalSubtitleView(source, status, { includeAddon: true }));
+      .map(({ source, status }) => externalSubtitleView(source, status, { includeAddon: true, baseUrl: playbackBaseUrl(req) }));
     res.json({ subtitles });
   };
   router.get("/subtitles/:type/:id/:extra.json", subtitlesHandler);
@@ -261,6 +290,18 @@ async function prepareEpisodeSelection({ type, videoId, sourceId = null }) {
     return manager.episodeView(sourceStore.get(record.sourceId), { jobId: job.id });
   }
   return manager.episodeView(sourceStore.get(record.sourceId));
+}
+
+function versionPlaylist(content, version) {
+  if (!version) return content;
+  return content.split("\n").map((line) => line.startsWith("#")
+    ? line.replace(/URI="([^"]+)"/g, (_match, uri) => `URI="${uri}${uri.includes("?") ? "&" : "?"}v=${version}"`)
+    : line.trim() ? `${line}${line.includes("?") ? "&" : "?"}v=${version}` : line).join("\n");
+}
+function validHlsVersion(req, res) {
+  if (!req.query.v || hlsMetadata(req.params.sourceId, req.query.v)) return true;
+  res.status(409).send("O vídeo foi atualizado; solicite a playlist atual");
+  return false;
 }
 
 function createApp() {
@@ -341,11 +382,12 @@ function createApp() {
   app.get("/play/:sourceId", async (req, res) => {
     const source = sourceStore.get(req.params.sourceId);
     if (!source) return res.status(404).send("Source not found");
+    sourceStore.upsert({ ...source, playbackProfile: "local" });
     watchStore.markPlayback(source);
     scheduleSeriesPrefetch(source.sourceId).catch((error) => logger.warn("Automatic series prefetch failed", { sourceId: source.sourceId, error: error.message }));
     const subtitleStatus = associatedTranslationStatus(source);
     if (subtitleStatus.status !== "ready") {
-      queueTranslationJob(source.sourceId, 1).catch((error) => logger.error("Failed to enqueue selected subtitle", { sourceId: source.sourceId, error: error.message }));
+      queueTranslationJob(source.sourceId, 1, { playbackProfile: "local" }).catch((error) => logger.error("Failed to enqueue selected subtitle", { sourceId: source.sourceId, error: error.message }));
     }
     if (source.localPath && fs.existsSync(source.localPath)) {
       if (subtitleStatus.status === "ready" && subtitleStatus.srtPath) {
@@ -372,28 +414,42 @@ function createApp() {
   app.get("/hls/:sourceId/master.m3u8", async (req, res) => {
     const source = sourceStore.get(req.params.sourceId);
     if (!source) return res.status(404).send("Source not found");
-    watchStore.markPlayback(source);
-    scheduleSeriesPrefetch(source.sourceId).catch((error) => logger.warn("Automatic series prefetch failed", { sourceId: source.sourceId, error: error.message }));
-    if (associatedTranslationStatus(source).status !== "ready") {
-      queueTranslationJob(source.sourceId, 1).catch((error) => logger.error("Failed to prepare HLS subtitle", { sourceId: source.sourceId, error: error.message }));
+    const subtitleStatus = associatedTranslationStatus(source);
+    if (subtitleStatus.associated && subtitleStatus.status === "ready") return res.redirect(307, `/hls/${subtitleStatus.subtitleSourceId}/master.m3u8${req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : ""}`);
+    if (source.playbackProfile !== "web") sourceStore.upsert({ sourceId: source.sourceId, playbackProfile: "web" });
+    if (subtitleStatus.status !== "ready") {
+      queueTranslationJob(source.sourceId, 1, { playbackProfile: "web" }).catch((error) => logger.error("Failed to prepare HLS subtitle", { sourceId: source.sourceId, error: error.message }));
+      res.setHeader("Retry-After", "30");
+      res.setHeader("Cache-Control", "no-store");
+      return res.status(503).send("Legenda PT-BR em preparação. A conversão WEB começará após a publicação.");
     }
     if (!source.localPath || !fs.existsSync(source.localPath)) {
-      queueTranslationJob(source.sourceId, 1).catch((error) => logger.error("Failed to prepare HLS source", { sourceId: source.sourceId, error: error.message }));
+      queueTranslationJob(source.sourceId, 1, { playbackProfile: "web" }).catch((error) => logger.error("Failed to prepare HLS source", { sourceId: source.sourceId, error: error.message }));
       res.setHeader("Retry-After", "30");
       res.setHeader("Cache-Control", "no-store");
       return res.status(503).send("Download e preparação iniciados. Tente este stream novamente em alguns minutos.");
     }
     try {
-      const subtitleSource = subtitleOwner(source);
-      try { repairSubtitleLayout(subtitleSource.sourceId); } catch (error) { logger.warn("Falha ao preservar layout HLS", { sourceId: subtitleSource.sourceId, error: error.message }); }
-      const translated = subtitlePath(subtitleSource.sourceId, "pt-BR.vtt");
-      const ass = subtitlePath(subtitleSource.sourceId, "pt-BR.ass");
-      const srt = subtitlePath(subtitleSource.sourceId, "pt-BR.srt");
-      const subtitleFile = fs.existsSync(ass) ? ass : fs.existsSync(srt) ? srt : null;
-      const { plan } = await ensureHls(source.sourceId, source.localPath, { subtitleFile });
+      const subtitleFile = subtitleStatus.assPath || subtitleStatus.srtPath;
+      const completed = hlsCacheComplete(source.sourceId, hlsInputFingerprint(source.localPath, subtitleFile));
+      if (!completed) {
+        await queueWebPreparation(source.sourceId, { priority: 1 });
+        res.setHeader("Retry-After", "30");
+        res.setHeader("Cache-Control", "no-store");
+        return res.status(503).send("Episódio WEB em conversão. Tente novamente quando aparecer WEB VOD.");
+      }
+      watchStore.markPlayback(source, "web");
+      scheduleSeriesPrefetch(source.sourceId).catch((error) => logger.warn("Automatic series prefetch failed", { sourceId: source.sourceId, error: error.message }));
+      let plan = completed.plan;
+      if (req.query.audio !== undefined) {
+        if (!/^\d+$/.test(String(req.query.audio))) return res.status(400).send("Faixa de áudio inválida");
+        const selected = plan.audioTracks?.find((track) => track.outputIndex === Number(req.query.audio));
+        if (!selected) return res.status(404).send("Faixa de áudio indisponível");
+        plan = { ...plan, audioTracks: [{ ...selected, isDefault: true }] };
+      }
       res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
       res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-      return res.send(buildHlsMasterPlaylist(fs.existsSync(translated) && !plan.subtitleBurnedIn, plan.audioTracks));
+      return res.send(versionPlaylist(buildHlsMasterPlaylist(plan), completed.generation || completed.fingerprint));
     } catch (error) {
       logger.error("HLS preparation failed", { sourceId: source.sourceId, error: error.message });
       res.setHeader("Retry-After", "15");
@@ -401,23 +457,26 @@ function createApp() {
     }
   });
 
-  app.get("/hls/:sourceId/video.m3u8", (req, res) => {
+  app.get(["/hls/:sourceId/video-only.m3u8", "/hls/:sourceId/video.m3u8"], (req, res) => {
+    if (!validHlsVersion(req, res)) return;
     let file;
-    try { file = hlsOutputPath(req.params.sourceId, "video.m3u8"); } catch (_) { return res.status(400).send("Invalid path"); }
+    const name = req.path.endsWith("/video-only.m3u8") ? "video-only.m3u8" : "video.m3u8";
+    try { file = hlsOutputPath(req.params.sourceId, name, req.query.v); } catch (_) { return res.status(400).send("Invalid path"); }
     if (!fs.existsSync(file)) return res.status(404).send("Video playlist not found");
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-    return fs.createReadStream(file).pipe(res);
+    return res.send(versionPlaylist(fs.readFileSync(file, "utf8"), req.query.v || hlsMetadata(req.params.sourceId)?.generation));
   });
 
   app.get("/hls/:sourceId/:audioPlaylist", (req, res, next) => {
     if (!/^audio-\d+\.m3u8$/.test(req.params.audioPlaylist)) return next();
+    if (!validHlsVersion(req, res)) return;
     let file;
-    try { file = hlsOutputPath(req.params.sourceId, req.params.audioPlaylist); } catch (_) { return res.status(400).send("Invalid path"); }
+    try { file = hlsOutputPath(req.params.sourceId, req.params.audioPlaylist, req.query.v); } catch (_) { return res.status(400).send("Invalid path"); }
     if (!fs.existsSync(file)) return res.status(404).send("Audio playlist not found");
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-    return fs.createReadStream(file).pipe(res);
+    return res.send(versionPlaylist(fs.readFileSync(file, "utf8"), req.query.v || hlsMetadata(req.params.sourceId)?.generation));
   });
 
   app.get("/hls/:sourceId/subtitles.m3u8", (req, res) => {
@@ -425,9 +484,9 @@ function createApp() {
     try {
       const source = sourceStore.get(req.params.sourceId);
       if (!source) return res.status(404).send("Source not found");
-      file = subtitlePath(subtitleOwner(source).sourceId, "pt-BR.vtt");
+      file = associatedTranslationStatus(source).path;
     } catch (_) { return res.status(400).send("Invalid path"); }
-    if (!fs.existsSync(file)) return res.status(404).send("Subtitle not found");
+    if (!file || !fs.existsSync(file)) return res.status(404).send("Subtitle not found");
     const vtt = fs.readFileSync(file, "utf8");
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
@@ -440,39 +499,40 @@ function createApp() {
     try {
       const source = sourceStore.get(req.params.sourceId);
       if (!source) return res.status(404).send("Source not found");
-      file = subtitlePath(subtitleOwner(source).sourceId, "pt-BR.vtt");
+      file = associatedTranslationStatus(source).path;
     } catch (_) { return res.status(400).send("Invalid path"); }
-    if (!fs.existsSync(file)) return res.status(404).send("Subtitle not found");
+    if (!file || !fs.existsSync(file)) return res.status(404).send("Subtitle not found");
     const segmentIndex = Number(req.params.segment);
     const vtt = fs.readFileSync(file, "utf8");
     if (segmentIndex * config.hls.segmentSeconds >= subtitleDurationSeconds(vtt)) return res.status(404).send("Subtitle segment not found");
     res.setHeader("Content-Type", "text/vtt; charset=utf-8");
-    res.setHeader("Cache-Control", "public, max-age=86400, immutable");
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
     return res.send(buildHlsSubtitleSegment(vtt, segmentIndex));
   });
 
   app.get("/hls/:sourceId/:fileName", (req, res) => {
     const { sourceId, fileName } = req.params;
-    if (!/^(?:segment|audio-\d+)-\d{5}\.ts$/.test(fileName)) return res.status(404).send("Not found");
+    if (!/^(?:video-only|segment|audio-\d+)-\d{5}\.ts$/.test(fileName)) return res.status(404).send("Not found");
+    if (!validHlsVersion(req, res)) return;
     let file;
-    try { file = hlsOutputPath(sourceId, fileName); } catch (_) { return res.status(400).send("Invalid path"); }
+    try { file = hlsOutputPath(sourceId, fileName, req.query.v); } catch (_) { return res.status(400).send("Invalid path"); }
     if (!fs.existsSync(file)) return res.status(404).send("Segment not found");
-    res.setHeader("Content-Type", "video/mp2t");
-    res.setHeader("Cache-Control", "public, max-age=86400, immutable");
-    return fs.createReadStream(file).pipe(res);
+    res.setHeader("Cache-Control", req.query.v ? "public, max-age=86400, immutable" : "no-store");
+    return serveLocalMedia(req, res, file);
   });
 
   app.get("/assets/subtitles/:sourceId/:fileName", (req, res) => {
     const { sourceId, fileName } = req.params;
     if (!["pending.vtt", "pt-BR.vtt", "pt-BR.srt", "pt-BR.ass", "original.vtt"].includes(fileName)) return res.status(404).send("Not found");
     if (!verifyPath(req.query.token, [sourceId, fileName], config.subtitleTokenSecret)) return res.status(403).send("Invalid or expired token");
-    if (["pt-BR.vtt", "pt-BR.ass"].includes(fileName)) try { repairSubtitleLayout(sourceId); } catch (error) { logger.warn("Falha ao preservar layout do recurso", { sourceId, error: error.message }); }
-    if (fileName === "pt-BR.srt") try {
-      const translated = subtitlePath(sourceId, "pt-BR.vtt");
-      if (fs.existsSync(translated)) ensureSrtSubtitle(sourceId, translated);
-    } catch (error) { logger.warn("Falha ao atualizar recurso SRT", { sourceId, error: error.message }); }
     let file;
-    try { file = subtitlePath(sourceId, fileName); } catch (_) { return res.status(400).send("Invalid path"); }
+    try {
+      const final = /^pt-BR\./.test(fileName);
+      const status = final ? require("./services/subtitleService").translationStatus(sourceId) : null;
+      if (final && status.status !== "ready") return res.status(404).send("Subtitle not published");
+      file = publishedFile(sourceId, fileName) || subtitlePath(sourceId, fileName);
+      if (req.query.v && !file.includes(String(req.query.v))) return res.status(409).send("A legenda foi atualizada; solicite o endereço atual");
+    } catch (_) { return res.status(400).send("Invalid path"); }
     if (!fs.existsSync(file)) return res.status(404).send("Subtitle not found");
     res.setHeader("Content-Type", fileName.endsWith(".ass")
       ? "text/x-ssa; charset=utf-8"
@@ -535,6 +595,21 @@ function createApp() {
   app.get("/api/jobs", (_req, res) => res.json({ jobs: sourceStore.list().map((source) => ({ sourceId: source.sourceId, videoId: source.videoId, addonName: source.addonName, ...readMeta(source.sourceId) })) }));
   app.get("/api/jobs/:sourceId", (req, res) => res.json({ source: sourceStore.publicSource(sourceStore.get(req.params.sourceId)), job: readMeta(req.params.sourceId) }));
   app.post("/api/sources/:sourceId/prepare", async (req, res, next) => { try { if (!sourceStore.get(req.params.sourceId)) return res.status(404).json({ error: "Source not found" }); const job = await queueTranslationJob(req.params.sourceId, 1); res.status(202).json({ jobId: job.id }); } catch (error) { next(error); } });
+  app.post("/api/sources/:sourceId/prepare-web", async (req, res, next) => {
+    try {
+      const source = sourceStore.get(req.params.sourceId);
+      if (!source) return res.status(404).json({ error: "Fonte não encontrada" });
+      if (!source.localPath || !fs.existsSync(source.localPath)) return res.status(409).json({ error: "Aguarde o download do episódio" });
+      const subtitleStatus = associatedTranslationStatus(source);
+      if (subtitleStatus.status !== "ready") return res.status(409).json({ error: "Aguarde a legenda PT-BR" });
+      const subtitleFile = subtitleStatus.assPath || subtitleStatus.srtPath || null;
+      const webSourceId = subtitleStatus.associated ? subtitleStatus.subtitleSourceId : source.sourceId;
+      sourceStore.upsert({ sourceId: webSourceId, playbackProfile: "web" });
+      await queueWebPreparation(webSourceId, { priority: 1 });
+      const ready = Boolean(hlsCacheComplete(webSourceId, hlsInputFingerprint(source.localPath, subtitleFile)));
+      return res.status(ready ? 200 : 202).json({ status: ready ? "ready" : "converting" });
+    } catch (error) { next(error); }
+  });
   app.post("/api/jobs/:sourceId/retry", async (req, res, next) => {
     try {
       const job = await getQueue().getJob(req.params.sourceId);
@@ -542,7 +617,7 @@ function createApp() {
       if ((await job.getState()) !== "failed") return res.status(409).json({ error: "Only failed jobs can be retried" });
       const failedFile = subtitlePath(req.params.sourceId, "failed.json");
       if (fs.existsSync(failedFile)) fs.unlinkSync(failedFile);
-      await job.retry();
+      await job.retry("failed", { resetAttemptsMade: true, resetAttemptsStarted: true });
       res.status(202).json({ jobId: job.id });
     } catch (error) { next(error); }
   });
@@ -619,37 +694,16 @@ function createApp() {
       if (!sourceStore.get(req.params.sourceId)) return res.status(404).json({ error: "Source not found" });
       const existing = await getQueue().getJob(req.params.sourceId);
       if (existing && (await existing.getState()) === "active") return res.status(409).json({ error: "A legenda já está sendo processada; aguarde a execução atual" });
-      for (const fileName of ["pt-BR.vtt", "pt-BR.ass", "original.vtt", "original-raw.vtt", "transcribed.vtt", "processing-audio.flac", "alignment-en-words.json", "alignment-audio-en.flac", "layout-complete.json", "failed.json", "validation-debug.vtt"]) {
+      const mode = req.body?.mode || "retranslate";
+      if (!["resume", "retranslate", "reextract"].includes(mode)) return res.status(400).json({ error: "Modo inválido: resume, retranslate ou reextract" });
+      if (existing && ["failed", "completed"].includes(await existing.getState())) await existing.remove();
+      const files = mode === "reextract" ? ["original.vtt", "original-raw.vtt", "transcribed.vtt", "alignment-en-words.json", "layout-complete.json", "failed.json", "validation-debug.vtt"] : ["failed.json"];
+      for (const fileName of files) {
         const file = subtitlePath(req.params.sourceId, fileName);
         if (fs.existsSync(file)) fs.rmSync(file, { force: true });
       }
-      transition(req.params.sourceId, "queued", {
-        progress: 0,
-        cues: null,
-        translated: null,
-        from: null,
-        to: null,
-        provider: null,
-        translationProvider: null,
-        languageDeclared: null,
-        languageDetected: null,
-        translationSourceLanguage: null,
-        translationRoute: null,
-        sourceAudioLanguage: null,
-        sourceAudioConfidence: null,
-        sourceMethod: null,
-        origin: null,
-        trackIndex: null,
-        alignment: null,
-        alignmentQuality: null,
-        sourceQuality: null,
-        finalQuality: null,
-        outputs: null,
-        error: null,
-        extractionError: null,
-        transcriptionFallbackReason: null,
-      });
-      const job = await queueTranslationJob(req.params.sourceId, 1);
+      transition(req.params.sourceId, "queued", { progress: 0, error: null, requestMode: mode });
+      const job = await queueTranslationJob(req.params.sourceId, 1, { force: mode !== "resume", retranslate: mode !== "resume", reextract: mode === "reextract" });
       res.status(202).json({ jobId: job.id });
     } catch (error) { next(error); }
   });
@@ -659,7 +713,12 @@ function createApp() {
     const fileName = names[req.params.kind];
     if (!fileName) return res.status(404).json({ error: "Artifact not found" });
     let file;
-    try { file = subtitlePath(req.params.sourceId, fileName); } catch (_) { return res.status(400).json({ error: "Invalid path" }); }
+    try {
+      file = req.params.kind === "final"
+        ? require("./services/subtitleService").translationStatus(req.params.sourceId).path
+        : subtitlePath(req.params.sourceId, fileName);
+    } catch (_) { return res.status(400).json({ error: "Invalid path" }); }
+    if (!file) return res.status(404).json({ error: "Subtitle not published" });
     if (!fs.existsSync(file)) return res.status(404).json({ error: "Subtitle not found" });
     res.setHeader("Content-Type", "text/vtt; charset=utf-8");
     res.setHeader("Content-Disposition", `attachment; filename="${req.params.sourceId}-${fileName}"`);
@@ -709,6 +768,7 @@ module.exports = {
   buildManifest,
   createApp,
   normalizedFilename,
+  playbackBaseUrl,
   selectSubtitleSources,
   subtitleRequestSelector,
   streamView,

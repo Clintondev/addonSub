@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 const { parseAudioFromMaster, parseSubtitlesFromMaster, pickTrack: pickHlsTrack } = require("../src/services/hls");
 const { listAudioTracks, listSubtitleReps, pickTrack: pickDashTrack } = require("../src/services/dash");
 const { subtitleLanguageOrder } = require("../src/services/languageStrategy");
+const { tryAdaptiveCandidates } = require("../src/services/adaptiveCandidates");
 
 test("HLS pairs an original audio language with its subtitle instead of a dub translation", () => {
   const master = [
@@ -31,4 +32,18 @@ test("DASH applies the same language pairing policy", () => {
   const strategy = subtitleLanguageOrder({ audioTracks: audio, preferredLangs: ["eng"], targetLocale: "pt-BR" });
   assert.equal(strategy.originalAudio.lang, "ko");
   assert.equal(pickDashTrack(subtitles, strategy.languages).lang, "ko");
+});
+
+test("HLS preserves an absolute subtitle URI containing a colon", () => {
+  const tracks = parseSubtitlesFromMaster('#EXT-X-MEDIA:TYPE=SUBTITLES,NAME="English",LANGUAGE="en",URI="https://media.example.test/sub.vtt"');
+  assert.equal(tracks[0].uri, "https://media.example.test/sub.vtt");
+});
+
+test("adaptive subtitle candidates continue after validation failure and exclude signs", async () => {
+  const tried = [];
+  const result = await tryAdaptiveCandidates([{ lang: "pt", name: "Signs", content: "sign" }, { lang: "pt", name: "Full", content: "bad" }, { lang: "en", name: "Full", content: "good" }],
+    { languages: ["pt", "en"], originalAudio: { lang: "en" } }, { allowIntermediateFallback: false, targetLocale: "pt-BR", validateCandidate: async (track) => { if (track.content === "bad") throw new Error("incomplete"); return track; } },
+    async (track) => { tried.push(track.content); return track; });
+  assert.deepEqual(tried, ["bad", "good"]);
+  assert.equal(result.content, "good");
 });

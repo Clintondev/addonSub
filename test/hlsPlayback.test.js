@@ -1,8 +1,11 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 const config = require("../src/config");
-const { buildFfmpegArgs, choosePlan } = require("../src/services/hlsPlayback");
-const { buildHlsMasterPlaylist, buildHlsSubtitlePlaylist, buildHlsSubtitleSegment, externalSubtitleView, streamView, streamViews, subtitleRequestSelector } = require("../src/index");
+const { buildFfmpegArgs, choosePlan, finalizeVodPlaylist, playlistComplete, playlistReady } = require("../src/services/hlsPlayback");
+const { buildHlsMasterPlaylist, buildHlsSubtitlePlaylist, buildHlsSubtitleSegment, externalSubtitleView, playbackBaseUrl, streamView, streamViews, subtitleRequestSelector } = require("../src/index");
 const { vttToSrt } = require("../src/services/subtitleService");
 
 function probe(videoCodec, audioCodec = "aac", channels = 2) {
@@ -29,7 +32,7 @@ test("copies browser-compatible H.264 but rebuilds the AAC timeline", () => {
       language: "eng",
       title: "English",
       isDefault: true,
-      playlist: null,
+      playlist: "audio-0.m3u8",
     }],
   });
 });
@@ -58,24 +61,25 @@ test("uses NVENC and converts incompatible audio for HEVC sources", () => {
   assert.ok(args.includes("0:1"));
 });
 
-test("burns PT-BR into browser video without duplicating the in-band default audio", () => {
+test("burns PT-BR into the video-only rendition and separates the default audio", () => {
   const plan = choosePlan(probe("hevc", "truehd", 6), true);
   plan.subtitleBurnedIn = true;
-  const args = buildFfmpegArgs("episode.mkv", "cache/video.m3u8", plan, config.hls, "/storage/subtitles/src_test/pt-BR.ass");
+  const args = buildFfmpegArgs("episode.mkv", "cache/video-only.m3u8", plan, config.hls, "/storage/subtitles/src_test/pt-BR.ass");
   const filter = args[args.indexOf("-vf") + 1];
   assert.match(filter, /subtitles=filename='\/storage\/subtitles\/src_test\/pt-BR\.ass'/);
   assert.ok(args.includes("aac"));
-  assert.ok(!args.some((argument) => argument.endsWith("audio-0.m3u8")));
+  assert.ok(args.includes("-an"));
+  assert.ok(args.some((argument) => argument.endsWith("audio-0.m3u8")));
 });
 
-test("muxes the default audio with video and generates playlists only for alternate languages", () => {
+test("generates separate English and Japanese audio playlists", () => {
   const media = probe("hevc", "truehd", 6);
   media.streams.push({ index: 2, codec_type: "audio", codec_name: "truehd", channels: 2, tags: { language: "jpn", title: "Japanese" } });
   const plan = choosePlan(media, true);
-  const args = buildFfmpegArgs("episode.mkv", "cache/video.m3u8", plan, config.hls);
-  assert.equal(plan.audioTracks[0].playlist, null);
+  const args = buildFfmpegArgs("episode.mkv", "cache/video-only.m3u8", plan, config.hls);
+  assert.equal(plan.audioTracks[0].playlist, "audio-0.m3u8");
   assert.equal(plan.audioTracks[1].playlist, "audio-1.m3u8");
-  assert.ok(!args.some((argument) => argument.endsWith("audio-0.m3u8")));
+  assert.ok(args.some((argument) => argument.endsWith("audio-0.m3u8")));
   assert.ok(args.some((argument) => argument.endsWith("audio-1.m3u8")));
   assert.ok(args.includes("0:1"));
   assert.ok(args.includes("0:2"));
@@ -87,6 +91,34 @@ test("falls back to libx264 when NVENC is unavailable", () => {
   assert.ok(buildFfmpegArgs("episode.mkv", "cache/master.m3u8", plan, config.hls).includes("libx264"));
 });
 
+test("marks a finished HLS playlist as finite VOD", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hls-vod-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const playlist = path.join(dir, "video.m3u8");
+  const growing = "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:EVENT\n#EXTINF:4.000,\nsegment-00000.ts\n";
+  fs.writeFileSync(playlist, growing);
+  assert.throws(() => finalizeVodPlaylist(playlist), /ainda não está completa/);
+  assert.equal(fs.readFileSync(playlist, "utf8"), growing);
+  fs.appendFileSync(playlist, "#EXT-X-ENDLIST\n");
+  finalizeVodPlaylist(playlist);
+  finalizeVodPlaylist(playlist);
+  const completed = fs.readFileSync(playlist, "utf8");
+  assert.match(completed, /#EXT-X-PLAYLIST-TYPE:VOD/);
+  assert.doesNotMatch(completed, /#EXT-X-PLAYLIST-TYPE:EVENT/);
+  assert.match(completed, /#EXT-X-ENDLIST/);
+});
+
+test("a playlist removed during HLS startup does not crash the addon", (t) => {
+  const missing = path.join(os.tmpdir(), "disappearing-audio.m3u8");
+  const original = fs.readFileSync;
+  t.mock.method(fs, "readFileSync", (file, ...args) => {
+    if (file === missing) throw Object.assign(new Error("gone"), { code: "ENOENT" });
+    return original.call(fs, file, ...args);
+  });
+  assert.equal(playlistReady(missing), false);
+  assert.equal(playlistComplete(missing), false);
+});
+
 test("adds a browser HLS option without leaking the MKV filename hint", () => {
   const item = {
     stream: { name: "1080p", title: "HEVC", infoHash: "abc", fileIdx: 1, behaviorHints: { filename: "episode.mkv" } },
@@ -95,25 +127,56 @@ test("adds a browser HLS option without leaking the MKV filename hint", () => {
   const views = streamViews(item, { savePending: false });
   assert.equal(views.length, 2);
   assert.match(views[0].url, /\/play\/src_hls_test\?profile=ptbr-stream-v2$/);
-  assert.match(views[1].url, /\/hls\/src_hls_test\/master\.m3u8\?profile=web-av-subs-v2$/);
+  assert.match(views[1].url, /\/hls\/src_hls_test\/master\.m3u8\?profile=web-vod-v5$/);
   assert.equal(views[1].behaviorHints.filename, "pt-auto-src_hls_test.m3u8");
   assert.match(views[1].name, /^WEB PREPARAR/);
 });
 
-test("advertises selectable audio tracks and non-forced PT-BR subtitles", () => {
-  const master = buildHlsMasterPlaylist(true, [
-    { title: "English: 5.1ch", language: "eng", channels: 2, isDefault: true, playlist: "audio-0.m3u8" },
-    { title: "Japanese: Stereo", language: "jpn", channels: 2, isDefault: false, playlist: "audio-1.m3u8" },
-  ]);
-  assert.match(master, /TYPE=AUDIO.*NAME="English: 5\.1ch".*DEFAULT=YES/);
-  assert.match(master, /NAME="English: 5\.1ch"[^\n]*DEFAULT=YES/);
-  assert.doesNotMatch(master, /NAME="English: 5\.1ch"[^\n]*URI=/);
-  assert.match(master, /TYPE=AUDIO.*NAME="Japanese: Stereo".*DEFAULT=NO.*URI="audio-1\.m3u8"/);
-  assert.match(master, /AUDIO="audio"/);
-  assert.match(master, /TYPE=SUBTITLES/);
-  assert.match(master, /NAME="Português \(Brasil\)"/);
-  assert.match(master, /TYPE=SUBTITLES.*DEFAULT=YES/);
-  assert.match(master, /SUBTITLES="subs"/);
+test("groups WEB streams consistently across episodes for Stremio autoplay", () => {
+  const makeItem = (sourceId, videoId) => ({
+    stream: { name: "Torrentio\n1080p" },
+    record: { sourceId, videoId, addonId: "upstream-1", addonName: "Torrentio" },
+  });
+  const status = { status: "preparing", associated: false };
+  const first = streamView(makeItem("src_first", "tt1234567:1:1"), "hls", { status });
+  const next = streamView(makeItem("src_next", "tt1234567:1:2"), "hls", { status });
+  const direct = streamView(makeItem("src_first", "tt1234567:1:1"), "direct", { status });
+  assert.equal(first.behaviorHints.bingeGroup, next.behaviorHints.bingeGroup);
+  assert.notEqual(first.behaviorHints.bingeGroup, direct.behaviorHints.bingeGroup);
+});
+
+test("advertises a video-only rendition with selectable English and Japanese audio", () => {
+  const master = buildHlsMasterPlaylist({
+    codecs: "avc1.640028,mp4a.40.2",
+    audioTracks: [
+      { title: "English", language: "eng", channels: 2, isDefault: true, playlist: "audio-0.m3u8" },
+      { title: "Japanese", language: "jpn", channels: 2, isDefault: false, playlist: "audio-1.m3u8" },
+    ],
+  });
+  assert.match(master, /NAME="English".*DEFAULT=YES.*URI="audio-0\.m3u8"/);
+  assert.match(master, /NAME="Japanese".*DEFAULT=NO.*URI="audio-1\.m3u8"/);
+  assert.match(master, /CODECS="avc1\.640028,mp4a\.40\.2",AUDIO="audio"\nvideo-only\.m3u8/);
+});
+
+test("a language-specific master lists only the chosen audio", () => {
+  const master = buildHlsMasterPlaylist({
+    codecs: "avc1.640028,mp4a.40.2",
+    audioTracks: [{ title: "Japanese", language: "jpn", isDefault: true, playlist: "audio-1.m3u8" }],
+  });
+  assert.match(master, /NAME="Japanese".*DEFAULT=YES.*URI="audio-1\.m3u8"/);
+  assert.doesNotMatch(master, /audio-0\.m3u8/);
+});
+
+test("local Stremio requests receive local media links", () => {
+  assert.equal(playbackBaseUrl({ headers: { host: "localhost:7000" } }), "http://localhost:7000");
+  assert.equal(playbackBaseUrl({ headers: { host: "127.0.0.1:7000" } }), "http://127.0.0.1:7000");
+  assert.equal(playbackBaseUrl({ headers: { host: "addon.asyncsystems.com.br" } }), config.baseUrl);
+  if (config.lanBaseUrl && config.lanClientIps.length) {
+    assert.equal(playbackBaseUrl({ headers: { host: "addon.asyncsystems.com.br", "cf-connecting-ip": config.lanClientIps[0] } }), config.lanBaseUrl);
+  }
+  const item = { stream: { name: "1080p" }, record: { sourceId: "src_local", infoHash: "abc", addonName: "Torrentio" } };
+  const views = streamViews(item, { baseUrl: "http://localhost:7000" });
+  assert.ok(views.every((view) => view.url.startsWith("http://localhost:7000/")));
 });
 
 test("advertises SubRip instead of ASS to Stremio external subtitle clients", () => {
@@ -163,7 +226,7 @@ test("reuses the HLS cache when recovered records point to the same physical med
     subtitleSourceId: "src_media_owner",
     srtUrl: "https://example.test/pt-BR.srt",
   } });
-  assert.match(hls.url, /\/hls\/src_media_owner\/master\.m3u8\?profile=web-av-subs-v2$/);
+  assert.match(hls.url, /\/hls\/src_media_owner\/master\.m3u8\?profile=web-vod-v5$/);
   assert.equal(hls.behaviorHints.filename, "pt-auto-src_media_owner.m3u8");
 });
 
@@ -178,4 +241,5 @@ test("maps the unique HLS filename back to the exact source", () => {
     sourceId: "src_abc123",
   });
   assert.equal(subtitleRequestSelector("filename=master.m3u8").sourceId, null);
+  assert.equal(subtitleRequestSelector("filename=pt-auto-src_abc123-audio-1.m3u8").sourceId, "src_abc123");
 });

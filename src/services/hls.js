@@ -2,10 +2,11 @@ const logger = require("../logger");
 const { sanitizeUrl } = require("../utils/security");
 const { safeRemoteFetch, safeRemoteText } = require("./safeRemoteFetch");
 const { canonicalLanguage, languageMatches, subtitleLanguageOrder, translationRoute } = require("./languageStrategy");
+const { tryAdaptiveCandidates } = require("./adaptiveCandidates");
 
 function parseAttributes(line) {
   const attrs = {};
-  const [, raw] = line.split(":");
+  const raw = line.slice(line.indexOf(":") + 1);
   if (!raw) return attrs;
   const regex = /([A-Z0-9-]+)=(".*?"|[^,]*)/g;
   let match;
@@ -107,10 +108,12 @@ async function downloadVttFromM3u8(uri, baseUrl, maxSegments = 10000) {
   }
 
   let output = "WEBVTT\n\n";
-  for (const seg of segments) {
-    const segText = await fetchText(seg);
-    const withoutHeader = segText.replace(/^\uFEFF?WEBVTT[^\r\n]*(?:\r?\n)+/i, "").trim();
-    output += `${withoutHeader}\n\n`;
+  for (let index = 0; index < segments.length; index += 4) {
+    const texts = await Promise.all(segments.slice(index, index + 4).map(fetchText));
+    for (const segText of texts) {
+      const withoutHeader = segText.replace(/^\uFEFF?WEBVTT[^\r\n]*(?:\r?\n)+/i, "").trim();
+      output += `${withoutHeader}\n\n`;
+    }
   }
   return output;
 }
@@ -145,8 +148,7 @@ async function extractHlsSubtitle(masterUrl, options = {}) {
     throw new Error("Nenhuma trilha de legenda HLS encontrada");
   }
   const strategy = subtitleLanguageOrder({ source: options.source, audioTracks, preferredLangs, targetLocale: options.targetLocale });
-  const track = pickTrack(tracks, strategy.languages);
-  if (!track) throw new Error("Falha ao selecionar trilha de legenda");
+  return tryAdaptiveCandidates(tracks, strategy, options, async (track) => {
 
   logger.info("Selecionada trilha HLS", {
     lang: track.lang,
@@ -166,6 +168,7 @@ async function extractHlsSubtitle(masterUrl, options = {}) {
     sourceAudioConfidence: strategy.originalAudio?.confidence || "unknown",
     translationRoute: translationRoute(track.lang, strategy.originalAudio),
   };
+  });
 }
 
 module.exports = {

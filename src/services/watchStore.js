@@ -24,7 +24,7 @@ function keyFor(source) {
   catch (_) { return source.videoId || source.sourceId; }
 }
 
-function markPlayback(source) {
+function markPlayback(source, playbackProfile = "local") {
   return withFileLock(lockFile, () => {
     const state = readState();
     const key = keyFor(source);
@@ -36,6 +36,7 @@ function markPlayback(source) {
       status: current.status === "completed" ? "watching" : (current.status || "watching"),
       currentVideoId: source.videoId,
       currentSourceId: source.sourceId,
+      playbackProfile,
       prefetchAhead: Number.isInteger(current.prefetchAhead) ? current.prefetchAhead : 0,
       playCount: (current.playCount || 0) + 1,
       firstPlayedAt: current.firstPlayedAt || new Date().toISOString(),

@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { extractFileSubtitle, pickTextTrack, pickPgsTrack, pgsOcrSupported, rankedTracks, srtToVtt } = require("../src/services/ffextract");
+const { extractFileSubtitle, pickTextTrack, pickPgsTrack, pgsOcrSupported, rankedTracks, selectTimingReferenceTrack, srtToVtt } = require("../src/services/ffextract");
 
 test("prefers Brazilian Portuguese textual subtitles before English", () => {
   const tracks = [{ ffIndex: 2, codec: "subrip", lang: "eng", forced: false }, { ffIndex: 3, codec: "ass", lang: "pob", forced: false }];
@@ -45,7 +45,16 @@ test("never sends an unsupported image-subtitle language to the English OCR engi
   assert.equal(pgsOcrSupported({ lang: "ara" }), false);
 });
 
-test("requests direct original-audio transcription before using an intermediate subtitle", async () => {
+test("uses a full embedded subtitle only as a timing reference for audio transcription", () => {
+  const tracks = [
+    { ffIndex: 3, codec: "hdmv_pgs_subtitle", lang: "eng", title: "Signs", forced: true },
+    { ffIndex: 4, codec: "hdmv_pgs_subtitle", lang: "eng", title: "English Full", forced: false },
+    { ffIndex: 5, codec: "subrip", lang: "spa", title: "Spanish Full", forced: false },
+  ];
+  assert.equal(selectTimingReferenceTrack(tracks, { lang: "ja" }).ffIndex, 4);
+});
+
+test("can require original-audio transcription when intermediate fallback is disabled", async () => {
   const mediaTracks = {
     audioTracks: [{ ffIndex: 1, type: "audio", lang: "jpn", title: "Japanese Original", disposition: { original: 1 } }],
     subtitleTracks: [{ ffIndex: 2, type: "subtitle", codec: "subrip", lang: "eng", title: "English Full", forced: false }],

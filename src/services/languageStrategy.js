@@ -90,6 +90,14 @@ function selectOriginalAudio(audioTracks = [], source = {}) {
   return { ...candidate, lang: canonicalLanguage(candidate.lang), reason: "first-usable-audio", confidence: "low" };
 }
 
+function selectTranscriptionAudio(audioTracks = [], source = {}) {
+  const original = selectOriginalAudio(audioTracks, source);
+  if (Number.isInteger(original?.ffIndex)) return original;
+  const available = selectOriginalAudio(audioTracks, {});
+  if (!Number.isInteger(available?.ffIndex)) return null;
+  return { ...available, reason: "original-audio-unavailable", confidence: "medium" };
+}
+
 function uniqueLanguages(values) {
   const output = [];
   for (const value of values) {
@@ -115,13 +123,25 @@ function translationRoute(subtitleLanguage, originalAudio) {
   return originalAudio ? "intermediate-language-fallback" : "source-language-unverified";
 }
 
+function resolveSourceLanguage(detectedLanguage, declaredLanguage, { audioTranscription = false } = {}) {
+  const detected = canonicalLanguage(detectedLanguage);
+  const declared = canonicalLanguage(declaredLanguage);
+  // Theme songs and opening credits can mislead detection over a short sample.
+  // A transcription explicitly constrained to a selected audio language has
+  // stronger evidence than that secondary text-language heuristic.
+  if (audioTranscription && declared !== "und") return declared;
+  return detected !== "und" ? detected : declared;
+}
+
 module.exports = {
   canonicalLanguage,
   countryLanguageCandidates,
   explicitOriginalLanguage,
   languageMatches,
+  resolveSourceLanguage,
   speechRecognitionLanguage,
   selectOriginalAudio,
+  selectTranscriptionAudio,
   subtitleLanguageOrder,
   translationRoute,
   unsuitableAudio,
