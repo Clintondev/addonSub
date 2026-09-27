@@ -39,9 +39,15 @@ function auditEmbeddedReference(cues, speech, reference) {
   const spoken = reference.intervals.filter((item) => nearIntervals([item], speech) === 1);
   const spokenCoverage = analyzeReferenceCoverage(cues, spoken, { toleranceSeconds: 0.75, minimumReferenceCues: 20 });
   const cueReferenceRatio = nearIntervals(timing, reference.intervals);
+  const missingSpoken = spoken.filter((item) => nearIntervals([item], timing) !== 1);
+  const openingGap = missingSpoken.filter((item) => item.start >= 25 && item.end <= 90).sort((a, b) => a.start - b.start);
+  const openingOnlyGap = openingGap.length > 0 && openingGap.length === missingSpoken.length
+    && openingGap.length <= Math.max(6, Math.ceil(spoken.length * 0.08))
+    && openingGap[openingGap.length - 1].end - openingGap[0].start <= 25
+    && cueReferenceRatio >= 0.95 && spokenCoverage.coverageRatio >= 0.9;
   return { trackIndex: reference.trackIndex, kind: reference.kind, metric: "temporal-overlap-only", cueReferenceRatio,
-    spokenCoverage, approved: cues.length >= 20 && cueReferenceRatio >= 0.9 && spokenCoverage.available
-      && spokenCoverage.coverageRatio >= 0.95 && spokenCoverage.longestUncoveredRunSeconds <= 25 };
+    spokenCoverage, openingOnlyGap, approved: cues.length >= 20 && cueReferenceRatio >= 0.9 && spokenCoverage.available
+      && (spokenCoverage.coverageRatio >= 0.95 || openingOnlyGap) && spokenCoverage.longestUncoveredRunSeconds <= 25 };
 }
 
 function auditExternalSynchronization(raw, synced, intervals, duration, settings = config.externalSubtitles, reference = null, method = "alass") {

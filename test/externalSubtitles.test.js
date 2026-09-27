@@ -83,6 +83,19 @@ test("sparse voice detection requires independent embedded timings to approve ex
   assert.throws(() => auditExternalSynchronization(content, content, [...detectedSpeech, { start: 120, end: 124 }], 125, { minimumSpeechCoverage: 0.99, minimumCueSpeechRatio: 0.65 }, reference), /insuficiente/);
 });
 
+test("accepts a short opening lyrics gap when embedded timing confirms the rest", () => {
+  const referenceCues = Array.from({ length: 80 }, (_, index) => cue(index * 3 + 1, index * 3 + 2, `Line ${index}`));
+  const reference = { authoritative: true, trackIndex: 4, kind: "pgs-display-timestamps",
+    intervals: referenceCues.map((_, index) => ({ start: index * 3 + 1, end: index * 3 + 1.01 })) };
+  const speech = referenceCues.flatMap((_, index) => index % 2 ? [] : [{ start: index * 3 + 1, end: index * 3 + 2 }]);
+  const withoutOpeningLyrics = serializeVtt(referenceCues.filter((_, index) => ![10, 12, 14].includes(index)));
+  const accepted = auditExternalSynchronization(withoutOpeningLyrics, withoutOpeningLyrics, speech, 245, undefined, reference);
+  assert.equal(accepted.embeddedReference.openingOnlyGap, true);
+  assert.equal(accepted.embeddedReference.approved, true);
+  const withoutMiddleDialogue = serializeVtt(referenceCues.filter((_, index) => ![30, 32, 34].includes(index)));
+  assert.throws(() => auditExternalSynchronization(withoutMiddleDialogue, withoutMiddleDialogue, speech, 245, undefined, reference), /insuficiente/);
+});
+
 test("public subtitle metadata excludes download addresses and authentication", () => {
   const result = publicCandidate({ provider: "subdl", id: "1", lang: "pt-br", score: 0.8, url: "https://private.example", token: "secret" });
   assert.equal(result.url, undefined);
