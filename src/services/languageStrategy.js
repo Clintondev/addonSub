@@ -33,6 +33,22 @@ function languageMatches(left, right) {
   return a === b || a.split("-")[0] === b.split("-")[0];
 }
 
+function subtitleLocale({ lang, trackTitle = "" } = {}) {
+  const language = canonicalLanguage(lang);
+  if (!languageMatches(language, "pt")) return language;
+  const title = String(trackTitle).toLowerCase();
+  if (language === "pt-pt" || /portugal|portugu[eê]s europeu|european portuguese|\bpt[-_]pt\b/u.test(title)) return "pt-pt";
+  if (language === "pt-br" || /brasil|brazil|\bpt[-_]br\b/u.test(title)) return "pt-br";
+  return language;
+}
+
+function isTargetSubtitleLocale(extraction, targetLocale = "pt-BR") {
+  const actual = subtitleLocale(extraction);
+  const target = canonicalLanguage(targetLocale);
+  if (!languageMatches(actual, target)) return false;
+  return !((actual === "pt-pt" && target === "pt-br") || (actual === "pt-br" && target === "pt-pt"));
+}
+
 function speechRecognitionLanguage(value) {
   const language = canonicalLanguage(value);
   return language === "und" ? null : language.split("-")[0];
@@ -135,6 +151,8 @@ function resolveSourceLanguage(detectedLanguage, declaredLanguage, { audioTransc
 
 module.exports = {
   canonicalLanguage,
+  subtitleLocale,
+  isTargetSubtitleLocale,
   countryLanguageCandidates,
   explicitOriginalLanguage,
   languageMatches,

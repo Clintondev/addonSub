@@ -7,7 +7,7 @@ const storage = fs.mkdtempSync(path.join(os.tmpdir(), "subtitle-pipeline-"));
 process.env.STORAGE_DIR = storage;
 const { createTranslationBudget, fitPromptSections, watchTranslationRequest } = require("../src/services/translationBudget");
 const { contextualChunks, parseTaggedTranslations, validateContextualTranslations, translateContextual, translateGemmaChunkResilient } = require("../src/services/translate");
-const { analyzeSpeechCoverage, assertCueIntegrity, assertSubtitleCompleteness, finalizeCues } = require("../src/services/subtitleQuality");
+const { analyzeSpeechCoverage, assertCueIntegrity, assertSubtitleCompleteness, finalizeCues, cueTiming } = require("../src/services/subtitleQuality");
 const { prepareSubtitleSource, selectSubtitleSource } = require("../src/services/subtitleSource");
 const { publishSubtitle, readPublication, publishedFile } = require("../src/services/subtitlePublication");
 const { translationStatus } = require("../src/services/subtitleService");
@@ -64,6 +64,17 @@ test("dense display fragments use spare time while preserving every word", () =>
   assert.equal(output.slice(0, -1).map((item) => item.text.replace(/\n/g, " ")).join(" "), text);
   assert.doesNotThrow(() => assertCueIntegrity(output, { maxCps: 30, minCueSeconds: 0.35, maxLines: 2, maxLineChars: 42 }));
   assert.throws(() => assertCueIntegrity([cue("Fala muito rápida.", "00:00:01.000 --> 00:00:01.100")], { maxCps: 30, minCueSeconds: 0.35 }), { code: "SUBTITLE_READABILITY" });
+});
+
+test("a final short word gets a readable display window inside its original cue", () => {
+  const text = `${"A".repeat(36)} ${"B".repeat(39)} Erza.`;
+  const output = finalizeCues([cue(text, "00:00:01.000 --> 00:00:05.090"), cue("Depois.", "00:00:05.090 --> 00:00:07.000")]);
+  assert.equal(output.length, 3);
+  assert.equal(output.slice(0, 2).map(v => v.text.replace(/\n/g, " ")).join(" "), text);
+  assert.equal(cueTiming(output[0]).start, 1);
+  assert.equal(cueTiming(output[1]).end, 5.09);
+  assert.ok(cueTiming(output[1]).end - cueTiming(output[1]).start >= 1);
+  assert.doesNotThrow(() => assertCueIntegrity(output, { maxCps: 30, minCueSeconds: 0.35, maxLines: 2, maxLineChars: 42 }));
 });
 test("all candidate failures advance to the next prepared source and cancellation stops fallback", async () => {
   const attempts = [];

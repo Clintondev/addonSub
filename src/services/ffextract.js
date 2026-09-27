@@ -150,7 +150,7 @@ async function extractPgsToVtt(sourceUrl, trackIndex, outputDir, forceExtract = 
   return applyPgsPositionsToVtt(vtt, supPath);
 }
 
-async function extractFileSubtitle(sourceUrl, outputDir, preferredLangs, { excludedTrackIndexes = [], mediaTracks = null, source = {}, targetLocale = "pt-BR", allowIntermediateFallback = false, validateCandidate = null, forceExtract = false } = {}) {
+async function extractFileSubtitle(sourceUrl, outputDir, preferredLangs, { excludedTrackIndexes = [], mediaTracks = null, source = {}, targetLocale = "pt-BR", allowIntermediateFallback = false, allowOcr = true, validateCandidate = null, forceExtract = false } = {}) {
   logger.info("Extraindo legenda embutida", { source: sanitizeUrl(sourceUrl) });
   const probed = mediaTracks || await probeMediaTracks(sourceUrl);
   const tracks = probed.subtitleTracks;
@@ -158,11 +158,11 @@ async function extractFileSubtitle(sourceUrl, outputDir, preferredLangs, { exclu
   const excluded = new Set(excludedTrackIndexes.map(Number));
   const strategy = subtitleLanguageOrder({ source, audioTracks: probed.audioTracks, preferredLangs, targetLocale });
   const ranked = rankedTracks(tracks, preferredLangs, { languageOrder: strategy.languages }).filter((track) => !excluded.has(Number(track.ffIndex)));
-  let candidates = ranked.filter((track) => kindRank(track) === 0 && (String(track.codec || "").toLowerCase() !== "hdmv_pgs_subtitle" || pgsOcrSupported(track)));
+  let candidates = ranked.filter((track) => kindRank(track) === 0 && (String(track.codec || "").toLowerCase() !== "hdmv_pgs_subtitle" || (allowOcr && pgsOcrSupported(track))));
   const fullTargetAvailable = candidates.some((track) => kindRank(track) === 0 && languageMatches(track.lang, targetLocale));
   const fullOriginalAvailable = candidates.some((track) => kindRank(track) === 0 && languageMatches(track.lang, strategy.originalAudio?.lang));
   if (!allowIntermediateFallback && !fullTargetAvailable && strategy.originalAudio && strategy.originalAudio.lang !== "und" && !fullOriginalAvailable) {
-    throw new Error(`Nenhuma legenda completa e segura no idioma original (${strategy.originalAudio.lang}); transcrição direta do áudio será usada antes de qualquer idioma intermediário`);
+    throw new Error(`Nenhuma legenda completa utilizável em português ou no idioma original (${strategy.originalAudio.lang}) nesta tentativa`);
   }
   if (!allowIntermediateFallback && strategy.originalAudio?.lang && strategy.originalAudio.lang !== "und") {
     candidates = candidates.filter((track) => languageMatches(track.lang, targetLocale) || languageMatches(track.lang, strategy.originalAudio.lang));
@@ -181,6 +181,7 @@ async function extractFileSubtitle(sourceUrl, outputDir, preferredLangs, { exclu
         lang: track.lang || "und",
         name: pgs ? `ocr-pgs-track-${track.ffIndex}` : `track-${track.ffIndex}`,
         trackIndex: track.ffIndex,
+        trackTitle: track.title || "",
         content,
         sourceAudioIndex: strategy.originalAudio?.ffIndex ?? null,
         sourceAudioLanguage: strategy.originalAudio?.lang || "und",

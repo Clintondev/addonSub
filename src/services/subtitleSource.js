@@ -1,16 +1,22 @@
 const { parseVtt, serializeVtt } = require("./vtt");
 const { normalizeOcrSourceText } = require("./translate");
+const { languageMatches } = require("./languageStrategy");
 const { assertCueIntegrity, assertSubtitleCompleteness, mergeShortCues, removeEmptyCues, removeTransientOcrNoise, suspiciousTranscriptionRepetitions, suspiciousTranscriptionArtifacts } = require("./subtitleQuality");
 
 async function prepareSubtitleSource(extraction, { duration, auditPgs, assertActive } = {}) {
   assertActive?.();
   const rawContent = extraction.rawContent || extraction.content;
-  let parsed = removeEmptyCues(parseVtt(extraction.content));
+  let parsed = parseVtt(extraction.content);
+  if (extraction.external) parsed = parsed.map((cue) => ({ ...cue,
+    text: cue.text.replace(/<\/?(?:i|b|u|font)(?:\s+[^<>]{0,120})?>/giu, ""),
+  }));
+  parsed = removeEmptyCues(parsed);
   if (extraction.name.startsWith("ocr-pgs")) parsed = removeTransientOcrNoise(parsed.map((cue) => ({ ...cue, text: normalizeOcrSourceText(cue.text) })));
   const transcribed = extraction.name === "faster-whisper";
   const cues = transcribed ? mergeShortCues(parsed) : parsed;
   const maxCueSeconds = transcribed ? 20 : 60;
   const quality = assertCueIntegrity(cues, { maxCueSeconds });
+  if (extraction.external) quality.externalSynchronization = extraction.external.synchronization;
   quality.completeness = assertSubtitleCompleteness(cues, duration, {
     strictDensity: false,
     maxInteriorGapSeconds: transcribed ? 45 : null,
@@ -30,13 +36,26 @@ async function prepareSubtitleSource(extraction, { duration, auditPgs, assertAct
   return { ...extraction, rawContent, content: serializeVtt(parsed), cues, sourceQuality: quality, maxCueSeconds };
 }
 
-async function selectSubtitleSource({ cached, embedded, transcribe, prepare, assertActive }) {
+async function selectSubtitleSource({ cached, embedded, transcribe, prepare, assertActive, external, isTarget = (candidate) => languageMatches(candidate.lang, "pt") }) {
   const errors = [];
-  if (cached) {
+  if (cached && !(external && languageMatches(cached.lang, "pt") && !isTarget(cached))) {
     try { return await prepare(cached); }
     catch (error) { if (error.code === "SOURCE_CANCELLED") throw error; errors.push(`cache: ${error.message}`); }
   }
-  for (const [name, operation] of [["embedded", () => embedded(false)], ["transcription", transcribe], ["intermediate", () => embedded(true)]]) {
+  let original = null;
+  if (external) {
+    assertActive?.();
+    try {
+      original = await embedded(false, { allowOcr: false });
+      if (isTarget(original)) return { ...original, sourceSelectionFailures: errors };
+    } catch (error) { if (error.code === "SOURCE_CANCELLED") throw error; errors.push(`embedded: ${error.message}`); }
+  }
+  const operations = external
+    ? [["external-target", () => external("target")], ["embedded-original", () => { if (original) return original; throw new Error("sem faixa original aprovada"); }],
+      ["external-original", () => external("original")], ["intermediate-text", () => embedded(true, { allowOcr: false })], ["external-fallback", () => external("fallback")],
+      ["embedded-ocr", () => embedded(false)], ["intermediate-ocr", () => embedded(true)], ["transcription", transcribe]]
+    : [["embedded", () => embedded(false)], ["transcription", transcribe], ["intermediate", () => embedded(true)]];
+  for (const [name, operation] of operations) {
     assertActive?.();
     try {
       const result = await operation();

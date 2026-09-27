@@ -1,6 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { mapTargetLocale } = require("../src/services/translate");
+const { assertTranslationsPreserved } = require("../src/services/forcedAlignment");
 const { analyzeCueIntegrity, analyzeReferenceCoverage, assertCueIntegrity, assertSubtitleCompleteness, localizeBrazilianPortuguese, mergeShortCues, finalizeCues, displayChunks, normalizeDialogueMarkers, preserveDialogueLayout, removeEmptyCues, removeTransientOcrNoise, suspiciousTranscriptionRepetitions, suspiciousTranscriptionArtifacts } = require("../src/services/subtitleQuality");
 
 test("maps Brazilian Portuguese to LibreTranslate API code", () => {
@@ -57,6 +58,33 @@ test("wraps and extends readable cues without overlapping the next cue", () => {
   const result = finalizeCues(cues);
   assert.ok(result[0].text.includes("\n"));
   assert.match(result[0].time, /--> 00:00:03\.920/);
+});
+
+test("borrows a fraction of a second from the following cue to keep dense PT-BR readable", () => {
+  const cues = [
+    { time: "00:24:03.380 --> 00:24:04.440", text: "Que seja." },
+    { time: "00:24:04.440 --> 00:24:06.710", text: "O Gray e o cara que precisa sair do armário não estão por perto também." },
+    { time: "00:24:06.710 --> 00:24:10.210", text: "O queixudo escorregou no queixo e o Gray foi atrás dele." },
+  ];
+  const finalized = finalizeCues(cues);
+  const quality = assertCueIntegrity(finalized, { maxCps: 30, minCueSeconds: 0.35, maxLines: 2, maxLineChars: 42 });
+  assert.equal(quality.fastCues, 0);
+  assert.equal(quality.overlaps, 0);
+  assert.match(finalized[1].time, /^00:24:04\.440 --> 00:24:06\.8/);
+  assert.doesNotThrow(() => assertTranslationsPreserved(cues, cues.map((item) => item.text), finalized));
+});
+
+test("redistributes dense dialogue across the next cue and a following gap", () => {
+  const cues = [
+    { time: "00:35:26.987 --> 00:35:28.652", text: "Oh, em alguns minutos você estará implorando para que eu faça..." },
+    { time: "00:35:28.653 --> 00:35:30.315", text: "...justamente isso, seu mentiroso..." },
+    { time: "00:35:30.395 --> 00:35:32.183", text: "Ele não está mentindo." },
+  ];
+  const finalized = finalizeCues(cues);
+  const quality = assertCueIntegrity(finalized, { maxCps: 30, minCueSeconds: 0.35, maxLines: 2, maxLineChars: 42 });
+  assert.equal(quality.fastCues, 0);
+  assert.equal(quality.overlaps, 0);
+  assert.doesNotThrow(() => assertTranslationsPreserved(cues, cues.map((item) => item.text), finalized));
 });
 
 test("splits expanded translations into at most two lines of 42 characters", () => {

@@ -178,7 +178,7 @@ function displayChunks(text, maxLineChars = 42, maxLines = 2, keepTogetherTerms 
   return chunks;
 }
 
-function finalizeCues(cues, { targetCps = 17, minDurationSeconds = 1, maxDurationSeconds = 7, gapSeconds = 0.08, keepTogetherTerms = [] } = {}) {
+function finalizeCues(cues, { targetCps = 17, minDurationSeconds = 1, maxDurationSeconds = 7, gapSeconds = 0.08, keepTogetherTerms = [], maxCps = 30 } = {}) {
   const displayCues = cues.flatMap((sourceCue, sourceIndex) => {
     const chunks = displayChunks(localizeBrazilianPortuguese(sourceCue.text), 42, 2, keepTogetherTerms);
     if (chunks.length === 1) return [{ ...sourceCue, text: chunks[0] }];
@@ -193,15 +193,29 @@ function finalizeCues(cues, { targetCps = 17, minDurationSeconds = 1, maxDuratio
     const availableEnd = next ? Math.max(timing.end, next.start - gapSeconds) : timing.start + Math.max(maxDurationSeconds, timing.end - timing.start);
     const extendedEnd = Math.min(availableEnd, Math.max(timing.end, timing.start + Math.min(chunks.length * maxDurationSeconds, desiredDuration)));
     const duration = extendedEnd - timing.start;
-    let elapsedWeight = 0;
+    const minimumFragmentDuration = Math.min(minDurationSeconds, duration / chunks.length);
+    const fragmentDurations = Array(chunks.length).fill(null);
+    let remainingDuration = duration;
+    let remainingWeight = totalWeight;
+    while (remainingWeight > 0) {
+      const brief = weights.map((weight, index) => ({ weight, index }))
+        .filter(({ weight, index }) => fragmentDurations[index] === null && remainingDuration * weight / remainingWeight < minimumFragmentDuration - 0.000001);
+      if (!brief.length) break;
+      for (const { weight, index } of brief) {
+        fragmentDurations[index] = minimumFragmentDuration;
+        remainingDuration -= minimumFragmentDuration;
+        remainingWeight -= weight;
+      }
+    }
+    let elapsedSeconds = 0;
     return chunks.map((text, index) => {
-      const start = timing.start + duration * elapsedWeight / totalWeight;
-      elapsedWeight += weights[index];
-      const end = index === chunks.length - 1 ? extendedEnd : timing.start + duration * elapsedWeight / totalWeight;
+      const start = timing.start + elapsedSeconds;
+      elapsedSeconds += fragmentDurations[index] ?? remainingDuration * weights[index] / remainingWeight;
+      const end = index === chunks.length - 1 ? extendedEnd : timing.start + elapsedSeconds;
       return setCueTiming({ ...sourceCue, id: index === 0 ? sourceCue.id : null, text }, start, end, timing.settings);
     });
   });
-  return displayCues.map((sourceCue, index) => {
+  const finalized = displayCues.map((sourceCue, index) => {
     let cue = sourceCue;
     const timing = cueTiming(cue);
     if (!timing) return cue;
@@ -211,6 +225,21 @@ function finalizeCues(cues, { targetCps = 17, minDurationSeconds = 1, maxDuratio
     const end = Math.min(latestEnd, Math.max(timing.end, timing.start + desired));
     return setCueTiming(cue, timing.start, end, timing.settings);
   });
+  for (let index = 0; index + 1 < finalized.length; index++) {
+    const current = cueTiming(finalized[index]);
+    const next = cueTiming(finalized[index + 1]);
+    if (!current || !next || next.start < current.end - 0.001 || next.start - current.end > 0.25) continue;
+    const needed = plainText(finalized[index].text).length / maxCps - (current.end - current.start) + 0.01;
+    if (needed <= 0 || needed > 0.5) continue;
+    const freeGap = Math.max(0, next.start - current.end);
+    const shiftNext = Math.max(0, needed - freeGap);
+    const following = index + 2 < finalized.length ? cueTiming(finalized[index + 2]) : null;
+    if (next.end - next.start - shiftNext < minDurationSeconds * 0.5
+      || (following && next.start + shiftNext >= following.start - 0.001)) continue;
+    finalized[index] = setCueTiming(finalized[index], current.start, current.end + needed, current.settings);
+    if (shiftNext) finalized[index + 1] = setCueTiming(finalized[index + 1], next.start + shiftNext, next.end, next.settings);
+  }
+  return finalized;
 }
 
 function analyzeCueIntegrity(cues, { maxCueSeconds = 20, maxLineChars = null, maxLines = null, maxCps = null, minCueSeconds = null } = {}) {
@@ -394,6 +423,7 @@ function analyzeReferenceCoverage(cues, referenceIntervals, { toleranceSeconds =
 
 module.exports = {
   analyzeSpeechCoverage,
+  cueTiming,
   analyzeCueIntegrity,
   analyzeReferenceCoverage,
   assertCueIntegrity,

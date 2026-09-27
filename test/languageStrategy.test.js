@@ -9,7 +9,7 @@ test("transcription follows the real dub when the declared original audio is abs
   assert.equal(track.reason, "original-audio-unavailable");
 });
 const {
-  canonicalLanguage, countryLanguageCandidates, languageMatches, resolveSourceLanguage, selectOriginalAudio, speechRecognitionLanguage, subtitleLanguageOrder, translationRoute,
+  canonicalLanguage, countryLanguageCandidates, languageMatches, resolveSourceLanguage, selectOriginalAudio, speechRecognitionLanguage, subtitleLanguageOrder, translationRoute, subtitleLocale, isTargetSubtitleLocale,
 } = require("../src/services/languageStrategy");
 
 test("normalizes common two and three-letter language tags", () => {
@@ -18,6 +18,14 @@ test("normalizes common two and three-letter language tags", () => {
   assert.equal(canonicalLanguage("pob"), "pt-br");
   assert.equal(languageMatches("por", "pt-BR"), true);
   assert.equal(speechRecognitionLanguage("pt-BR"), "pt");
+});
+
+test("Portuguese from Portugal does not count as a Brazilian subtitle", () => {
+  const european = { lang: "pt", trackTitle: "Portuguese (Portugal)" };
+  assert.equal(subtitleLocale(european), "pt-pt");
+  assert.equal(isTargetSubtitleLocale(european, "pt-BR"), false);
+  assert.equal(isTargetSubtitleLocale({ lang: "pt-br" }, "pt-BR"), true);
+  assert.equal(isTargetSubtitleLocale({ lang: "pt", trackTitle: "Portuguese (Brazil)" }, "pt-BR"), true);
 });
 
 test("keeps the confirmed audio language when opening cues confuse text detection", () => {

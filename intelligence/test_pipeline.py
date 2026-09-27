@@ -23,7 +23,7 @@ def functions():
         node.decorator_list = []
     module = ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[]))
     namespace = {"os": os, "re": re, "Path": Path, "SimpleNamespace": SimpleNamespace,
-                 "TranscriptionRequest": SimpleNamespace, "AlignmentRequest": SimpleNamespace,
+                 "TranscriptionRequest": SimpleNamespace, "AlignmentRequest": SimpleNamespace, "SubtitleSyncRequest": SimpleNamespace,
                  "HTTPException": HTTPError, "model_lock": Lock(), "logger": logging.getLogger("test")}
     exec(compile(module, "app-functions", "exec"), namespace)
     return namespace

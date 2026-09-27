@@ -25,7 +25,7 @@ const { withGpuLock } = require("./services/gpuLock");
 const { scheduleSeriesPrefetch } = require("./services/seriesPrefetch");
 const { ensureEmbeddedPlayback } = require("./services/embeddedPlayback");
 const { downloadRemoteMedia } = require("./services/remoteMedia");
-const { canonicalLanguage, languageMatches, resolveSourceLanguage, selectOriginalAudio, selectTranscriptionAudio, speechRecognitionLanguage, translationRoute } = require("./services/languageStrategy");
+const { canonicalLanguage, languageMatches, resolveSourceLanguage, selectOriginalAudio, selectTranscriptionAudio, speechRecognitionLanguage, translationRoute, subtitleLocale, isTargetSubtitleLocale } = require("./services/languageStrategy");
 const { enrichContentLanguageMetadata } = require("./services/contentMetadata");
 const { nameAliasesForSource } = require("./services/nameAliases");
 const { seriesDialogueCorrectionsForSource, seriesTerminologyForSource } = require("./services/seriesTerminology");
@@ -37,6 +37,8 @@ const { getWebQueue, queueWebPreparation, processWebJob } = require("./services/
 const { parsePgsPositions } = require("./services/pgs");
 const { mediaIdentity } = require("./services/mediaIdentity");
 const { createTranslationBudget } = require("./services/translationBudget");
+const { createExternalSubtitleSession } = require("./services/externalSubtitles");
+const { createSubtitleProviders } = require("./services/subtitleProviders");
 
 function cancelledError() {
   const error = new Error("Job cancelado porque a fonte foi excluída");
@@ -61,7 +63,7 @@ function cachedExtraction(sourceId, fingerprint) {
   if (!removeEmptyCues(cues).length) return null;
   if (meta.origin === "faster-whisper" && suspiciousTranscriptionArtifacts(cues).length) return null;
   return {
-    content, lang: meta.languageDeclared || "und", name: meta.origin, trackIndex: meta.trackIndex ?? null, cached: true,
+    content, lang: meta.languageDeclared || "und", name: meta.origin, trackIndex: meta.trackIndex ?? null, trackTitle: meta.trackTitle || "", cached: true,
     supPath: Number.isInteger(meta.trackIndex) ? subtitlePath(sourceId, `track-${meta.trackIndex}.sup`) : null,
     sourceAudioIndex: meta.sourceAudioIndex ?? null,
     sourceAudioLanguage: meta.sourceAudioLanguage || "und",
@@ -72,6 +74,9 @@ function cachedExtraction(sourceId, fingerprint) {
     transcriptionRecoveryReason: meta.sourceQuality?.transcriptionRecoveryReason || null,
     repairedTranscriptionSegments: Number(meta.sourceQuality?.repairedTranscriptionSegments || 0),
     speechIntervals: meta.sourceQuality?.speechIntervals || null,
+    external: meta.externalSubtitle || null,
+    externalSearchFailures: meta.externalSearchFailures || [],
+    sourceSelectionFailures: meta.sourceSelectionFailures || [],
   };
 }
 
@@ -223,10 +228,12 @@ async function processJob(job) {
       if (!mediaDuration) throw new Error("Mídia local sem duração confirmada");
     }
     const fingerprint = mediaFingerprint(mediaInput);
-    const extractionFingerprint = stableHash(JSON.stringify({ version: 3, media: fingerprint,
+    const extractionFingerprint = stableHash(JSON.stringify({ version: 7, media: fingerprint,
       originalAudio: mediaTracks ? selectOriginalAudio(mediaTracks.audioTracks, source) : null,
       preferred: config.preferredSubtitleLangs, target: config.targetLocale,
-      originalLanguage: source.originalLanguage || source.original_language || null, country: source.country || null }), 48);
+      originalLanguage: source.originalLanguage || source.original_language || null, country: source.country || null,
+      external: [config.externalSubtitles.enabled, Boolean(config.externalSubtitles.subdlKey), Boolean(config.externalSubtitles.opensubtitlesKey && config.externalSubtitles.opensubtitlesUsername && config.externalSubtitles.opensubtitlesPassword),
+        config.externalSubtitles.minimumSpeechCoverage, config.externalSubtitles.minimumCueSpeechRatio] }), 48);
     const profile = stableHash(JSON.stringify({ version: 3, locale: config.targetLocale, model: config.contextualTranslatorModel,
       fallback: config.contextualTranslatorFallbackModel, alignment: config.forcedAlignmentEnabled, extractionFingerprint,
       readability: [config.subtitleMaxCps, config.subtitleMinCueSeconds], aliases: nameAliasesForSource(source),
@@ -247,12 +254,12 @@ async function processJob(job) {
       auditPgs: (value, sourceCues) => auditEmbeddedCoverage(value, sourceCues, mediaInput, packetTimings),
     });
     const excludedTracks = [];
-    const embedded = async (allowIntermediateFallback) => {
+    const embedded = async (allowIntermediateFallback, { allowOcr = true } = {}) => {
       const adaptiveOptions = { preferredLangs: config.preferredSubtitleLangs, source, targetLocale: config.targetLocale, allowIntermediateFallback, validateCandidate: prepare, assertActive: active };
       if (/\.m3u8(?:$|\?)/i.test(mediaInput)) return extractHlsSubtitle(mediaInput, adaptiveOptions);
       if (/\.mpd(?:$|\?)/i.test(mediaInput)) return extractDashSubtitle(mediaInput, adaptiveOptions);
       return extractFileSubtitle(mediaInput, outputDir, config.preferredSubtitleLangs, {
-        mediaTracks, source, targetLocale: config.targetLocale, allowIntermediateFallback,
+        mediaTracks, source, targetLocale: config.targetLocale, allowIntermediateFallback, allowOcr,
         excludedTrackIndexes: excludedTracks, forceExtract: Boolean(job.data.reextract),
         validateCandidate: async (candidate) => {
           try { return await prepare(candidate); }
@@ -260,25 +267,33 @@ async function processJob(job) {
         },
       });
     };
-    const extraction = await selectSubtitleSource({
+    const externalSession = mediaTracks && createSubtitleProviders().configured().length
+      ? createExternalSubtitleSession({ source, mediaInput, outputDir, mediaTracks, prepare, assertActive: active }) : null;
+    let extraction;
+    const localeCandidate = (candidate) => ({ ...candidate, trackTitle: candidate.trackTitle
+      || mediaTracks?.subtitleTracks.find((track) => track.ffIndex === candidate.trackIndex)?.title || "" });
+    try { extraction = await selectSubtitleSource({
       cached: job.data.reextract ? null : cachedExtraction(sourceId, extractionFingerprint),
       embedded, prepare, assertActive: active,
+      isTarget: (candidate) => isTargetSubtitleLocale(localeCandidate(candidate), config.targetLocale),
+      external: externalSession ? (tier) => externalSession.find(tier) : null,
       transcribe: async () => {
         transition(sourceId, "transcribing", { progress: 42 });
         return prepare(await transcribeWithGpu(mediaInput, outputDir, source, job, mediaTracks ? selectTranscriptionAudio(mediaTracks.audioTracks, source) : null));
       },
-    });
+    }); } finally { externalSession?.cleanup(); }
     const cues = extraction.cues.map((cue, sourceIndex) => ({ ...cue, sourceIndex }));
     const maxCueSeconds = extraction.maxCueSeconds;
     const sourceQuality = extraction.sourceQuality;
     if (extraction.name.startsWith("ocr-pgs") && !extraction.cached) writeFileAtomic(subtitlePath(sourceId, "original-raw.vtt"), extraction.rawContent);
     writeFileAtomic(subtitlePath(sourceId, "original.vtt"), extraction.content);
     transition(sourceId, "synchronizing", {
-      progress: 50, origin: extraction.name, languageDeclared: extraction.lang, trackIndex: extraction.trackIndex ?? null,
+      progress: 50, origin: extraction.name, languageDeclared: extraction.lang, trackIndex: extraction.trackIndex ?? null, trackTitle: extraction.trackTitle || null,
       extractionFingerprint, extractionCached: Boolean(extraction.cached),
       sourceAudioIndex: extraction.sourceAudioIndex ?? null, sourceAudioLanguage: extraction.sourceAudioLanguage || "und",
       sourceAudioReason: extraction.sourceAudioReason || "unavailable", sourceAudioConfidence: extraction.sourceAudioConfidence || "unknown",
       translationRoute: extraction.translationRoute, sourceQuality, sourceSelectionFailures: extraction.sourceSelectionFailures,
+      externalSubtitle: extraction.external || null, externalSearchFailures: extraction.cached ? extraction.externalSearchFailures : externalSession?.failures || [],
     });
     if (extraction.name === "faster-whisper" && config.transcriptionReferenceAuditEnabled && mediaTracks) {
       const referenceTrack = selectTimingReferenceTrack(mediaTracks.subtitleTracks, selectOriginalAudio(mediaTracks.audioTracks, source));
@@ -297,12 +312,16 @@ async function processJob(job) {
     const sample = [0.2, 0.5, 0.8].flatMap((ratio) => cues.slice(Math.floor(cues.length * ratio), Math.floor(cues.length * ratio) + 8)).map((cue) => cue.text).join("\n").slice(0, 4000);
     const detected = canonicalLanguage(await detectLanguage(sample, config.libreTranslateUrl));
     const declaredLanguage = canonicalLanguage(extraction.lang);
-    const sourceLanguage = resolveSourceLanguage(detected, declaredLanguage, { audioTranscription: extraction.name === "faster-whisper" });
-    const effectiveTranslationRoute = extraction.name === "faster-whisper"
+    const needsPortugueseLocalization = languageMatches(declaredLanguage, "pt")
+      && !isTargetSubtitleLocale(localeCandidate(extraction), config.targetLocale);
+    const sourceLanguage = needsPortugueseLocalization ? subtitleLocale(localeCandidate(extraction))
+      : extraction.external && declaredLanguage !== "und" ? declaredLanguage
+        : resolveSourceLanguage(detected, declaredLanguage, { audioTranscription: extraction.name === "faster-whisper" });
+    const effectiveTranslationRoute = needsPortugueseLocalization ? "portuguese-localization" : extraction.name === "faster-whisper"
       ? extraction.translationRoute || "direct-selected-audio-transcription"
       : translationRoute(sourceLanguage, extraction.sourceAudioLanguage && extraction.sourceAudioLanguage !== "und"
         ? { lang: extraction.sourceAudioLanguage } : null);
-    const isPortuguese = languageMatches(sourceLanguage, "pt") || languageMatches(declaredLanguage, "pt");
+    const isPortuguese = !needsPortugueseLocalization && (languageMatches(sourceLanguage, "pt") || languageMatches(declaredLanguage, "pt"));
     if (isPortuguese) {
       const finalized = finalizeCues(cues);
       const vtt = serializeVtt(finalized);

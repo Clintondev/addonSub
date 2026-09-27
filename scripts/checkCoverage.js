@@ -20,7 +20,7 @@ child.once("close", (code, signal) => {
     process.exitCode = code || 1;
     return;
   }
-  const aggregate = output.match(/# all files\s+\|\s+([\d.]+)\s+\|\s+([\d.]+)\s+\|\s+([\d.]+)/);
+  const aggregate = output.match(/all files\s+\|\s+([\d.]+)\s+\|\s+([\d.]+)\s+\|\s+([\d.]+)/);
   if (!aggregate) {
     console.error("Could not read the aggregate test coverage report");
     process.exitCode = 1;

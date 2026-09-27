@@ -98,3 +98,17 @@ test("reconstructs the original translations from split display cues without dup
   assert.doesNotThrow(() => assertTranslationsPreserved(source, ["Primeira frase.", "Segunda frase."], display));
   assert.throws(() => assertTranslationsPreserved(source, ["Primeira diferente.", "Segunda frase."], display), /alterou o conteúdo/);
 });
+
+test("preserves distinct source cues that start at the same time", () => {
+  const source = [
+    { sourceIndex: 0, time: "00:00:10.900 --> 00:00:13.150", text: "Os Dragon Slayers!" },
+    { sourceIndex: 1, time: "00:00:10.900 --> 00:00:13.350", text: "Magos da Fairy Tail!" },
+  ];
+  const display = [
+    { sourceIndex: 0, time: source[0].time, text: source[0].text },
+    { sourceIndex: 1, time: source[1].time, text: source[1].text },
+  ];
+  assert.deepEqual(reconstructTranslations(source, display), source.map((cue) => cue.text));
+  assert.doesNotThrow(() => assertTranslationsPreserved(source, source.map((cue) => cue.text), display));
+  assert.throws(() => assertTranslationsPreserved(source, ["Outra fala", source[1].text], display), /alterou o conteúdo/);
+});

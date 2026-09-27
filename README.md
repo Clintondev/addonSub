@@ -40,7 +40,7 @@ http://localhost:7000/manifest.json
 4. Aguarde o download terminar e abra novamente a lista de streams.
 5. No aplicativo para PC ou em aparelhos compatíveis, selecione `LOCAL`. Quando a legenda está pronta, o gateway cria sem recodificação um MKV de reprodução que preserva o vídeo e todas as faixas de áudio, incorpora uma única legenda SRT chamada `Português (Brasil)` e a marca como padrão. O índice de navegação fica no início do arquivo e a mídia usa blocos curtos, próprios para leitura remota por intervalos, evitando buscas até o final do MKV durante a troca das falas. A versão SRT externa continua disponível como alternativa.
 6. No Stremio Web, iPhone ou aparelho que rejeite MKV/x265, selecione `WEB PREPARAR` para iniciar a conversão HLS. Esse primeiro clique pode mostrar uma falha temporária. Quando a lista passar a mostrar `WEB VOD`, selecione o episódio novamente: a playlist completa informa a duração total e permite avançar ou voltar para qualquer minuto. O áudio padrão permanece dentro do vídeo em AAC, evitando silêncio em navegadores que não carregam uma playlist de áudio separada; os outros idiomas aparecem como alternativas no seletor. Para não depender do suporte inconsistente dos players web a WebVTT HLS, o PT-BR é aplicado à imagem durante a conversão H.264. O SRT externo continua disponível, e o modo `LOCAL` mantém a legenda selecionável.
-7. Durante a preparação, o gateway prioriza legendas dentro do próprio arquivo: texto PT-BR, texto em outro idioma e PGS por OCR. Somente quando nenhuma delas existe ele transcreve o áudio com Whisper `large-v3`.
+7. Durante a preparação, o gateway aproveita português embutido ou busca PT-BR pronto nos catálogos configurados. Quando necessário, sincroniza a legenda externa com o arquivo local e traduz fontes em outros idiomas. OCR e Whisper `large-v3` permanecem disponíveis quando não há uma fonte textual aprovada.
 8. Ao escolher um episódio de série, o gateway prepara em segundo plano a quantidade de episódios seguintes configurada no gerenciador (de 0 a 12; o padrão é 0). Pacotes de temporada reutilizam exatamente o mesmo torrent; para torrents individuais, a busca mantém o mesmo add-on, grupo, resolução, codec e tipo de release sempre que possível. O Stremio pode selecionar automaticamente o próximo stream WEB do mesmo tipo, mas ele só começa a tocar quando a conversão VOD desse episódio também estiver completa.
 
 O episódio escolhido usa prioridade alta. Os episódios antecipados usam prioridade baixa e não são enfileirados novamente quando vídeo e legenda já estão prontos. Quando você abre o episódio seguinte, a janela avança e novos episódios são acrescentados até manter a quantidade configurada. Com o valor 0, nenhum download antecipado é feito.
@@ -174,6 +174,30 @@ A preparação WEB tem fila própria e começa após a publicação da legenda. 
 O endpoint `POST /api/sources/:sourceId/reprocess` aceita `mode`: `resume` retoma checkpoints, `retranslate` gera traduções novas reutilizando a extração e `reextract` refaz também a extração/OCR. O padrão é `retranslate`. As versões anteriores permanecem disponíveis durante a preparação.
 
 ## Qualidade e verificação
+
+### Legendas prontas e sincronização de versões diferentes
+
+O worker consulta SubDL e OpenSubtitles.com quando suas credenciais estão configuradas no `.env`. Uma legenda textual completa em português já embutida evita consultas externas. Na ausência dela, o worker procura PT-BR pronto antes de traduzir uma faixa textual original; depois procura uma fonte externa no idioma original, aproveita texto embutido em idiomas intermediários e busca inglês e os demais idiomas configurados nas APIs. Legendas externas são sincronizadas antes da tradução. OCR de imagens PGS só é tentado depois dessas alternativas textuais; transcrição do áudio fica por último. A API paga de tradução dos catálogos não é utilizada: a tradução continua local.
+
+Crie uma chave gratuita no [painel de API do SubDL](https://subdl.com/panel/api). Para o OpenSubtitles.com, crie uma conta e uma chave em [API Consumers](https://www.opensubtitles.com/en/consumers). Configure:
+
+```dotenv
+EXTERNAL_SUBTITLES_ENABLED=true
+SUBDL_API_KEY=
+OPENSUBTITLES_API_KEY=
+OPENSUBTITLES_USERNAME=
+OPENSUBTITLES_PASSWORD=
+```
+
+Para conferir o login e as cotas sem mostrar credenciais, execute `node scripts/check-subtitle-providers.js`. A opção `--search` testa uma busca PT-BR; `--download` também baixa um candidato por serviço para validar o acesso (consome cota, sem publicar ou modificar sua biblioteca). As credenciais não aparecem no gerenciador ou nos logs.
+
+As fontes são filtradas por IMDb, temporada, episódio, idioma e versão do arquivo. OpenSubtitles usa também seu próprio hash de vídeo, calculado sobre o arquivo local; o hash do torrent não é usado como hash de legenda. Resultados de busca ficam em cache por seis horas, ou quinze minutos quando não há resultados, e erros de autenticação/cota suspendem temporariamente as consultas. O padrão limita cada preparação a quatro candidatos externos: até dois em português, reservando uma tentativa para o idioma original e uma para inglês/outros idiomas. Tentativas não utilizadas passam para as etapas seguintes.
+
+Para cada candidato, o áudio original selecionado é extraído e o ALASS 2.0.0 ajusta atrasos, velocidade e cortes por trecho no serviço `intelligence`. A sincronização ocorre antes da tradução. O texto original externo fica em `external-original.vtt`; `original.vtt` contém a fonte aprovada já sincronizada. O gerenciador informa o provedor e a cobertura temporal de fala detectada. O vídeo original não é editado.
+
+O candidato é rejeitado se perder texto durante o ajuste, ultrapassar a duração do vídeo, tiver cobertura de fala abaixo de 85% ou uma lacuna contínua de fala superior a 25 segundos. Normalmente, pelo menos 65% das entradas precisam estar próximas de áudio falado. Quando o detector encontra pouca fala, o sistema também pode conferir uma faixa completa embutida: exige pelo menos 20 referências, 90% das entradas externas próximas dos tempos embutidos, cobertura de 95% das referências próximas de fala detectada e nenhuma lacuna dessas referências acima de 25 segundos. Para PGS, lê apenas as marcações de exibição das imagens, sem OCR. Essa conferência adicional não dispensa os limites de cobertura do áudio. Essas medidas conferem tempos, não comprovam semanticamente cada diálogo. Música pode ser detectada como fala, e montagens com diálogos diferentes podem exigir outra legenda ou transcrição. O sistema não tenta inventar trechos ausentes: rejeita o candidato e segue as alternativas existentes.
+
+`EXTERNAL_SUBTITLE_MAX_CANDIDATES`, `EXTERNAL_SUBTITLE_SYNC_TIMEOUT_MINUTES`, `EXTERNAL_SUBTITLE_MIN_SPEECH_COVERAGE` e `EXTERNAL_SUBTITLE_MIN_CUE_SPEECH_RATIO` ajustam os limites. Fontes adaptativas remotas continuam usando as faixas do stream; a busca externa com ajuste requer mídia local. Após alterar o código e preencher as credenciais, atualize os serviços com `docker compose up -d --build`.
 
 ```powershell
 npm run check

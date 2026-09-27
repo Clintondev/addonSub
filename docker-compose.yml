@@ -38,9 +38,17 @@ services:
     env_file: [.env]
     command: ["npm", "run", "worker"]
     environment:
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
       STORAGE_DIR: /usr/src/app/storage
     volumes:
       - ${STORAGE_HOST_PATH:-./storage}:/usr/src/app/storage
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
     depends_on:
       redis: { condition: service_healthy }
       intelligence: { condition: service_healthy }
@@ -71,6 +79,7 @@ services:
     environment:
       STORAGE_DIR: /usr/src/app/storage
       WHISPER_MODEL: ${WHISPER_MODEL:-large-v3}
+      EXTERNAL_SUBTITLE_SYNC_TIMEOUT_MINUTES: ${EXTERNAL_SUBTITLE_SYNC_TIMEOUT_MINUTES:-10}
       WHISPER_DEVICE: ${WHISPER_DEVICE:-cuda}
       WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-float16}
       WHISPER_VAD_THRESHOLD: ${WHISPER_VAD_THRESHOLD:-0.35}

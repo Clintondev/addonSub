@@ -61,8 +61,18 @@ test("can require original-audio transcription when intermediate fallback is dis
   };
   await assert.rejects(
     extractFileSubtitle("unused.mkv", ".", ["eng"], { mediaTracks, targetLocale: "pt-BR" }),
-    /transcrição direta do áudio/,
+    /Nenhuma legenda completa utilizável/,
   );
+});
+
+test("text-only extraction defers supported PGS images without starting OCR", async () => {
+  const mediaTracks = {
+    audioTracks: [{ ffIndex: 1, lang: "ja", disposition: { original: 1 } }],
+    subtitleTracks: [{ ffIndex: 4, codec: "hdmv_pgs_subtitle", lang: "en", title: "English Full", forced: false }],
+  };
+  await assert.rejects(extractFileSubtitle("unused.mkv", ".", ["en"], {
+    mediaTracks, allowIntermediateFallback: true, allowOcr: false,
+  }), /Nenhuma trilha de legenda textual ou PGS utilizável/);
 });
 
 test("converts OCR SRT timestamps to WebVTT", () => {

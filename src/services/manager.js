@@ -48,7 +48,9 @@ function episodeView(source) {
       : ["queued", "prefetch-queued"].includes(meta.stage) || source.acquisitionState === "queued" ? "queued"
         : meta.stage === "failed" && downloadProgress < 100 ? "failed" : "not-started";
   const origin = String(meta.origin || "");
-  const sourceMethod = origin.startsWith("ocr-pgs") ? "PGS convertido por OCR"
+  const sourceMethod = origin === "external-subdl" ? "Legenda pronta do SubDL"
+    : origin === "external-opensubtitles" ? "Legenda pronta do OpenSubtitles"
+    : origin.startsWith("ocr-pgs") ? "PGS convertido por OCR"
     : origin === "faster-whisper" ? "Áudio transcrito pelo Whisper"
       : /hls/i.test(origin) ? "Legenda extraída do HLS"
         : /dash/i.test(origin) ? "Legenda extraída do DASH"
@@ -83,6 +85,8 @@ function episodeView(source) {
       provider: meta.translationProvider || null,
       alignment: meta.alignmentQuality || null,
       sourceQuality: meta.sourceQuality || null,
+      external: meta.externalSubtitle || null,
+      externalSearchFailures: meta.externalSearchFailures || [],
       finalQuality: meta.finalQuality || null,
       cues: meta.cues || null,
       updatedAt: meta.updatedAt || null,

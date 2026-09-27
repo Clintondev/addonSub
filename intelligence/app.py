@@ -12,11 +12,13 @@ from faster_whisper import WhisperModel
 from faster_whisper.audio import decode_audio
 from faster_whisper.vad import get_speech_timestamps, VadOptions
 from pydantic import BaseModel
+from subtitle_sync import synchronize
 
 app = FastAPI(title="PT-AUTO Intelligence Worker")
 storage_root = Path(os.environ.get("STORAGE_DIR", "/usr/src/app/storage")).resolve()
 model = None
 model_lock = Lock()
+sync_lock = Lock()
 logger = logging.getLogger("pt-auto-intelligence")
 
 
@@ -32,6 +34,35 @@ class AlignmentRequest(BaseModel):
     mediaPath: str
     language: str = "en"
     prompt: str = ""
+
+
+class SubtitleSyncRequest(BaseModel):
+    sourceId: str
+    audioPath: str
+    subtitlePath: str
+    fileName: str = "subtitle.srt"
+    season: int | None = None
+    episode: int | None = None
+
+
+@app.post("/sync-subtitle")
+def sync_subtitle(request: SubtitleSyncRequest):
+    audio = storage_file(request.audioPath, "audioPath")
+    subtitle = storage_file(request.subtitlePath, "subtitlePath")
+    if audio.parent != subtitle.parent:
+        raise HTTPException(status_code=400, detail="subtitle and audio must share the source directory")
+    with sync_lock:
+        try:
+            result = synchronize(audio, subtitle, request.fileName, request.season, request.episode,
+                                 timeout=int(os.environ.get("EXTERNAL_SUBTITLE_SYNC_TIMEOUT_MINUTES", "10")) * 60)
+            waveform = decode_audio(str(audio), sampling_rate=16000)
+            intervals = get_speech_timestamps(waveform, VadOptions(threshold=0.35, min_speech_duration_ms=120,
+                                                                 min_silence_duration_ms=500, speech_pad_ms=200))
+            result["speechIntervals"] = [{"start": interval["start"] / 16000, "end": interval["end"] / 16000} for interval in intervals]
+            return result
+        except Exception as error:
+            logger.warning("External subtitle synchronization rejected (%s): %s", type(error).__name__, str(error)[:180])
+            raise HTTPException(status_code=422, detail="external subtitle synchronization failed")
 
 
 def timestamp(seconds: float) -> str:

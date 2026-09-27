@@ -6,3 +6,5 @@ storage
 *.log
 npm-debug.log*
 yarn-error.log*
+__pycache__/
+*.pyc

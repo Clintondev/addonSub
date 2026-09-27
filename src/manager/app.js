@@ -124,6 +124,12 @@ function auditDetail(sub) {
   const transcription = sub.sourceQuality?.transcription;
   const reference = sub.sourceQuality?.referenceAudit;
   const details = [];
+  const externalSync = sub.external?.synchronization;
+  if (externalSync) {
+    details.push(`sincronizada com seu vídeo · cobertura de fala ${percent(externalSync.coverageRatio)}`);
+    if (externalSync.adjustedBySections) details.push("tempos ajustados por trecho");
+    if (externalSync.embeddedReference?.approved) details.push("tempos conferidos com a legenda embutida");
+  }
   if (transcription?.averageWordProbability != null) details.push(`confiança das palavras ${percent(transcription.averageWordProbability)}`);
   if (reference?.available) details.push(`cobertura conferida ${percent(reference.coverageRatio)} (somente tempos da faixa ${reference.language || "auxiliar"})`);
   if (sub.sourceQuality?.transcriptionRecoveryReason) details.push("recuperação por janelas aplicada");

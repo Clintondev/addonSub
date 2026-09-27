@@ -25,6 +25,21 @@ function plainText(value) {
 }
 
 function reconstructTranslations(sourceCues, displayCues) {
+  // Formatting preserves sourceIndex even when separate source cues share a
+  // timestamp. Timing alone cannot distinguish those simultaneous cues.
+  if (displayCues.some((cue) => Number.isInteger(cue.sourceIndex))) {
+    const translations = sourceCues.map(() => []);
+    for (const cue of displayCues) {
+      if (!Number.isInteger(cue.sourceIndex) || cue.sourceIndex < 0 || cue.sourceIndex >= sourceCues.length) {
+        throw new Error("Could not map displayed cue back to a source cue");
+      }
+      translations[cue.sourceIndex].push(plainText(cue.text));
+    }
+    if (translations.some((parts) => !parts.length || parts.some((part) => !part))) {
+      throw new Error("Could not reconstruct every source translation");
+    }
+    return translations.map((parts) => parts.join(" "));
+  }
   const consumed = new Set();
   const translations = sourceCues.map((sourceCue, index) => {
     const timing = cueTiming(sourceCue);
